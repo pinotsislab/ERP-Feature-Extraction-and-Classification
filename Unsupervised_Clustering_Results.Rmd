@@ -1,0 +1,1045 @@
+---
+title: "Clustering Analysis"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  word_document: default
+---
+
+# Clustering the Participants with Unsupervised Learning
+```{r Render options, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+knitr::opts_chunk$set(warning = F)
+
+```
+
+
+```{r cluster libraries, message=FALSE, warning=FALSE, include=FALSE}
+library(tidyverse)
+library(recipes)
+
+library(tsne)
+library(umap)
+library(embed)
+
+
+library(glue)
+library(rgl)
+library(infer)
+library(patchwork)
+ 
+set.seed(321)
+
+```
+
+
+```{r load data, include=FALSE}
+
+DCM_df = read_csv("../Data/flat_full_data.csv") %>% 
+  mutate(y = factor(y))
+
+# Only consider certain B features
+good_Bs <- c("B1", "B32", "B43", "B54", "B56", "B65", "B67", "B74", "B76", "B78","B85", "B87", "B89")
+DCM_B_features <- DCM_df %>% select(good_Bs)
+
+DCM_df <- DCM_df %>% 
+  select(-starts_with("B")) %>% 
+  bind_cols(., DCM_B_features)
+
+# ERP features
+
+ERP_df = read_csv("/home/sean/pCloudDrive/Work/Depression Classification/Data/ERP_results_all_Channels.csv") %>% 
+  mutate(y = case_when(substr(.$SubjID, 1, 2) == "hc" ~ "-1",
+                           substr(.$SubjID, 1, 2) == "pp" ~ "1",
+                           TRUE ~ "NULL")) %>% 
+  mutate(y = factor(y))
+
+df_wide = ERP_df %>%
+  group_by(SubjID) %>%
+  mutate(PeakAmp_Diff = PeakAmp_Control - PeakAmp_Interference,
+          # MeanAmp_Diff = MeanAmp_Control - MeanAmp_Interference,
+          Latency_Diff = Latency_Control - Latency_Interference) %>%
+   # dplyr::select(SubjID, y, Channel, PeakAmp_Diff, Latency_Diff) %>% ## Only use Peak Amp and Latency
+  dplyr::select(SubjID, y, Channel, PeakAmp_Control, PeakAmp_Interference, Latency_Control, Latency_Interference) %>% 
+  pivot_wider(names_from = Channel,
+              values_from = c(PeakAmp_Control, PeakAmp_Interference, Latency_Control, Latency_Interference)) %>%
+               # values_from = c(PeakAmp_Diff, Latency_Diff)) %>%
+  ungroup() %>%
+  dplyr::select(-SubjID)
+
+```
+
+## t-test for differences in ERP data
+
+```{r}
+
+ERP_df %>% 
+  # group_by(Channel) %>% 
+  pivot_longer(cols = starts_with("PeakAmp"),
+               names_to = "Condition",
+               names_prefix = "PeakAmp_",
+               values_to = "Peak") %>% 
+  select(SubjID, Channel, Condition, Peak) -> PeakERP_data
+
+ERP_df %>% 
+  pivot_longer(cols = starts_with("Latency"),
+               names_to = "Condition",
+               names_prefix = "Latency_",
+               values_to = "Latency") %>% 
+  select(SubjID, Channel, Condition, Latency) -> LatencyERP_data
+  
+
+PeakERP_data %>% 
+  group_by(Channel) %>% 
+  do(t_test(., formula = Peak ~ Condition,
+         order = c("Interference", "Control"),
+         alternative = "two-sided"))
+  # left_join(., LatencyERP_data, by = c("SubjID", "Channel", "Condition")) %>% 
+  # group_by(Channel) -> t_test_df 
+
+Latency_tTests <- 
+     LatencyERP_data %>% 
+    do(t_test(., formula = Latency ~ Condition,
+         order = c("Interference", "Control"),
+         alternative = "two-sided"))
+
+# Non-parametric tests
+   
+PeakERP_data %>%
+  group_by(Channel) %>%
+  do(tidy(
+    wilcox.test(Peak ~ Condition,
+                data=.,
+                paired=T,
+                conf.int = T))) %>% 
+  arrange(p.value) %>% 
+  filter(p.value < 0.0006849315) %>% 
+  mutate(across(is.numeric, round, 3))
+
+latency_Wilcox_tests_corrected <- 
+  LatencyERP_data %>% 
+  group_by(Channel) %>%
+  do(tidy(
+    wilcox.test(Latency ~ Condition,
+                data=.,
+                paired=T,
+                conf.int = T))) %>% 
+  arrange(p.value) %>% 
+  filter(p.value < 0.0006849315) %>% 
+  mutate(across(is.numeric, round, 3))
+
+```
+
+
+## t-SNE Clustering - DCM vs. ERP
+
+```{r cluster data preprocessing, echo=FALSE}
+
+ERP_clusterable_data <- recipe(df_wide, y ~ .) %>% 
+  step_zv(all_predictors()) %>% 
+  # step_smote(y, neighbors = 2) %>% 
+  # step_log(all_predictors(), offset 
+  step_normalize(all_predictors()) %>%
+  prep() %>%
+  juice()
+  
+
+ DCM_clusterable_data <- recipe(DCM_df, y ~ .) %>% 
+  step_zv(all_predictors()) %>% 
+  # step_smote(y, neighbors = 2) %>% 
+  # step_log(all_predictors(), offset 
+  # step_normalize(all_predictors()) %>%
+  prep() %>%
+  juice()
+
+
+```
+
+
+```{r tSNE hyperparameters, include=FALSE}
+
+perplx = 4
+dims = 3 # 2 or 3 dimensional plot
+iterations = 2500
+
+```
+
+
+```{r initialize a data frame to capture t test results from the entire doc}
+all_tTests <- data.frame()
+```
+
+### Methods
+
+To visually explore the differences between the ERP and DCM data, lower dimensional representations of the high dimensional feature space were created. Unsupervised clustering was used to investigate latent patterns in the feature data sets. Input features from each data set were transformed into 3-dimensional and 2-dimensional plots with t-stochastic neighbor embedding (t-SNE) (#! van der Maaten). The t-SNE approach  projects local structure from high-dimensional space into lower dimensional space. 
+
+To create the embedding values, t-SNE method minimizes the Kullback-Leibler divergence between a similarity matrix in higher dimensional space (the number of input features is the number of dimensions) and the targeted number of lower dimensions (either 2 or 3) using iterations of gradient descent. The similarity matrix in higher dimensional space assumes a Gaussian distribution of points and relies on a perplexity parameter as a "smooth measure of the effective number of neighbors" to estimate local variance (#! van der Maaten). The similarity matrix in lower dimensional space is estimated by a Students t-distribution with 1 degree of freedom. The primary advantage of this method is that t-SNE is capable of showing non-linear relationships between the data features, compared to principle components analysis which reflects only linear relationships. 
+
+t-SNE representations were created for both the ERP and DCM data sets independently using a perplexity hyperparameter of `r perplx` with 2 and 3 dimensional representations of each patient were produced and labeled according to their status as a patient or control. `r iterations`  iterations were made until stable embedding values emerged. 
+
+The results below show the t-SNEs for the ERP data set with all features, and subsets of the Peak Amplitude, Mean Amplitude, and Latency features.  Similarly, the DCM data set t-SNEs were created for all features, and subsets of the A, B, G, H, and T parameters independently.
+
+## Results
+### t-SNE - ERP fit
+```{r Fit tSNE - ERP}
+
+print("Fitting All ERP features")
+ERP_tsne = tsne(as.matrix(dplyr::select(ERP_clusterable_data, -y)),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations)
+
+print("Fitting Peak Amplitude ERP features")
+ERP_Peak_tsne = tsne(as.matrix(dplyr::select(ERP_clusterable_data, starts_with("PeakAmp"))),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations)
+
+# print("Fitting Mean Amplitude ERP features")
+# ERP_Mean_tsne = tsne(as.matrix(dplyr::select(ERP_clusterable_data, starts_with("MeanAmp"))),
+#                 k = dims,
+#                 perplexity = perplx,
+#                 max_iter = iterations)
+
+print("Fitting Latency ERP features")
+ERP_Lat_tsne = tsne(as.matrix(dplyr::select(ERP_clusterable_data, starts_with("Latency"))),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations)
+
+```
+
+
+### t-SNE - DCM fit
+```{r Fit tSNE - DCM}
+## All DCM data
+print("Fitting All DCM features")
+DCM_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, -y)),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations,
+                  epoch = 500)
+
+## Param-specific DCM data
+print("Fitting B DCM features")
+DCM_B_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, starts_with("B"))),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations,
+                  epoch = 500)
+
+print("Fitting T DCM features")
+DCM_T_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, starts_with("T"))),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations,
+                  epoch = 500)
+
+print("Fitting H DCM features")
+DCM_H_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, starts_with("H"))),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations,
+                  epoch = 500)
+
+print("Fitting G DCM features")
+DCM_G_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, starts_with("G"))),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations,
+                  epoch = 500)
+
+print("Fitting A DCM features")
+DCM_A_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, starts_with("A"))),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations,
+                  epoch = 500)
+
+```
+
+### Full ERP and DCM datasets Comparisons 
+ERP data set with `r dim(as.matrix(dplyr::select(ERP_clusterable_data, -y)))[2]` input features and DCM with `r dim(as.matrix(dplyr::select(DCM_clusterable_data, -y)))[2]` input features. These are represented in 2D
+
+```{r Plot tSNE, echo=FALSE, fig.height=7, fig.width=8, message=FALSE, warning=FALSE}
+
+plot_tSNE <- function(tsne_res, dims, clusterable_data) {
+  
+  if (dims == 2){
+    
+  tsne_plot <- 
+    tsne_res %>%
+    as_tibble(.) %>% 
+    mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient"))) %>% 
+    ggplot(aes(x=V1,
+               y=V2,
+               color = Label)) + 
+    geom_point(size = 2.5) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          text = element_text(size = 18)) +
+    labs(title = glue("t-SNE Clustering on {dataset} feature set"), 
+         subtitle = glue("{dims} dimensional representation of perplexity = {perplx}"))
+  
+  } else if (dims == 3){
+    
+    mycolors <- c("#F8766D", "#00BFC4")
+    
+    tsne_plot <-
+      tsne_res %>% 
+      as_tibble(.) %>%
+      mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient"))) %>% 
+      mutate(Color = mycolors[as.numeric(Label)]) %>%
+      plot3d(x=.$V1, y=.$V2, z=.$V3, 
+      col = .$Color, 
+      type = 's', 
+      size = 4.5,
+      radius = 4.5,
+      xlab="V1", ylab="V2", zlab="V3")
+    
+    rgl_add_axes(x=tsne_res$V1, y=tsne_res$V2, z=tsne_res$V3, show.bbox = TRUE)
+    movie3d(spin3d(axis = c(0, 0, 1)), duration = 3,
+        dir = getwd())
+  }
+  
+  return(tsne_plot)
+  
+}
+
+dataset = "ERP"
+ERP_cluster <- plot_tSNE(ERP_tsne, dims, ERP_clusterable_data) 
+
+dataset = "DCM"
+DCM_cluster <- plot_tSNE(DCM_tsne, dims, DCM_clusterable_data)
+
+ERP_cluster
+
+DCM_cluster 
+
+```
+
+We also examine subsets of the ERP data to examine clustering of the Peak Amplitude and Latency independently.  The Peak amplitude data used  `r dim(as.matrix(dplyr::select(ERP_clusterable_data, starts_with("PeakAmp"))))[2]` input features and the Latency data with `r dim(as.matrix(dplyr::select(ERP_clusterable_data, starts_with("Latency"))))[2]` input features.
+
+```{r ERP subset tsne results, fig.height=7, fig.width=8}
+
+ERP_Peak_cluster_plot <- plot_tSNE(ERP_Peak_tsne, dims, ERP_clusterable_data) 
+if(dims == 2){
+  
+ ERP_Peak_cluster_plot <-  ERP_Peak_cluster_plot + labs(title = "Peak Amplitude Embeddings")
+}
+
+# ERP_MeanAmp_cluster_plot <- plot_tSNE(ERP_Mean_tsne, 2, ERP_clusterable_data) + labs(title = "Mean Amplitude Embeddings")
+
+ERP_Lat_cluster_plot <- plot_tSNE(ERP_Lat_tsne, dims, ERP_clusterable_data) 
+if(dims == 2){
+  
+ ERP_Lat_cluster_plot <-  ERP_Lat_cluster_plot + labs(title = "Latency Embeddings")
+}
+
+ERP_Peak_cluster_plot
+ERP_Lat_cluster_plot
+
+```
+
+The same can be done with subsets of the DCM data, subset by each parameter:
+-A with `r dim(dplyr::select(DCM_clusterable_data, starts_with("A")))[2]` features
+-B with `r dim(dplyr::select(DCM_clusterable_data, starts_with("B")))[2]` features
+-G with `r dim(dplyr::select(DCM_clusterable_data, starts_with("G")))[2]` features
+-H with `r dim(dplyr::select(DCM_clusterable_data, starts_with("H")))[2]` features
+-T with `r dim(dplyr::select(DCM_clusterable_data, starts_with("T")))[2]` features
+
+```{r DCM subset tsne results}
+
+DCM_A_cluster_plot <- plot_tSNE(DCM_A_tsne, dims, ERP_clusterable_data) + labs(title = "A")
+
+DCM_B_cluster_plot <- plot_tSNE(DCM_B_tsne, dims, ERP_clusterable_data) + labs(title = "B")
+
+DCM_G_cluster_plot <- plot_tSNE(DCM_G_tsne, dims, ERP_clusterable_data) + labs(title = "G")
+
+DCM_H_cluster_plot <- plot_tSNE(DCM_H_tsne, dims, ERP_clusterable_data) + labs(title = "H")
+
+DCM_T_cluster_plot <- plot_tSNE(DCM_T_tsne, dims, ERP_clusterable_data) + labs(title = "T")
+
+```
+
+```{r plots, fig.height=5, fig.width=7}
+
+DCM_A_cluster_plot
+DCM_B_cluster_plot
+DCM_G_cluster_plot
+DCM_H_cluster_plot
+DCM_T_cluster_plot
+
+```
+
+### Plot distance comparison between patients and controls in 3 dimensional space
+
+The B parameter from the DCM data set was the most informative in the classification models. In 2D, the plot shows a clustering of depressed patients. In 3D embedding space, depressed patients lie are the outermost points of the sphere, exhibiting more extreme embedding values than the centrally clustered control participants.
+The plot below quantifies this distinction in 3D by showing the distribution of distances from the origin of the embedding values grouped by label. One-sided t-tests show the distributions of distances from the origin are significantly different between depressed patients and control participants when represented with DCM B parameter embeddings. While it should be noted that the magnitude of distances in the embedding space are not meaningful, the relative shape is. The spherical distance reflects the more extreme embedding values of the depressed patients. 
+
+It should be noted the t-test is comparing imbalanced groups as the data was not adjusted for class imbalance.
+
+```{r get distances function, fig.height=7, fig.width=7.5, message=FALSE, warning=FALSE, include=FALSE}
+
+
+get_Distances <- function(tsne_res, dims, clusterable_data) {
+  
+if (dims == 2){
+  
+  tsne_stats <- tsne_res %>% 
+    as_tibble(.) %>%
+    mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient")),
+           Distance_Origin = sqrt(V1^2 + V2^2)) %>% 
+    arrange(desc(Distance_Origin))
+  
+  tsne_stats
+  
+} else if (dims ==3){
+  
+  tsne_stats <- tsne_res %>% 
+    as_tibble(.) %>%
+    mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient")),
+           Distance_Origin = sqrt(V1^2 + V2^2 + V3^2)) %>% 
+    arrange(desc(Distance_Origin))
+  
+  tsne_stats}
+  
+return(tsne_stats)
+}
+
+```
+
+The same analysis was also conducted on A, G, H, T, and all combined DCM parameters
+
+```{r compare the A G H T DCM t-SNE results between patients and controls, fig.height=7, fig.width=7.5, message=FALSE, warning=FALSE}
+
+DCM_params <- c("all", "B", "A", "G", "H", "T")
+ dims <-  3
+ 
+
+for(i in 1:length(DCM_params)){
+  
+  letter <- DCM_params[i]
+  print(letter)
+  
+if(letter == "all"){
+  DCM_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, !y)),
+                k = 3,
+                perplexity = perplx,
+                max_iter = iterations,
+                  epoch = 500)
+}else{
+DCM_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, starts_with(letter))),
+                k = 3,
+                perplexity = perplx,
+                max_iter = iterations,
+                  epoch = 500)
+}
+  
+tsne_stats <- get_Distances(DCM_tsne, 3, DCM_clusterable_data)
+
+distances_plot <- 
+  tsne_stats %>% 
+  ggplot(aes(x=Distance_Origin, fill = Label)) +
+  geom_density(alpha = 0.6) +
+  labs(title = glue("t-SNE Distance from Origin - DCM {letter} Data"),
+       subtitle = glue("{dims} dimensional representation; perplexity = {perplx}"),
+       x = "Distance from the Origin",
+       y = "Density") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        text = element_text(size = 18))
+  
+distances_ttest_table <- 
+  tsne_stats %>% 
+  t_test(x= ., 
+         formula = Distance_Origin ~ Label,
+         order = c("Control", "Depressed Patient"),
+         alternative = "less")  %>% 
+  mutate_if(is.numeric, round, 3)
+
+# save results to the all_tTest table
+distances_ttest_table %>% 
+  mutate(`Data Set` = "DCM",
+         `Parameter Set` = letter) %>% 
+  select(`Data Set`, `Parameter Set`, everything()) -> distances_ttest_table
+
+all_tTests <- rbind(all_tTests, distances_ttest_table)
+
+
+ t_test_density_plot <- distances_plot / gridExtra::tableGrob(distances_ttest_table)
+print(t_test_density_plot)
+
+}
+```
+
+The ERP data does not exhibit this difference nor do either of the subsets of ERP features (Peak Amplitude and Latency) when used to generate separate 3D embeddings. Peak Amplitude provides marginal evidence for a difference in distance from the origin, but the shape of the 3D plot does not support this conclusion. 
+
+```{r ERP distances, fig.height=7, fig.width=7.5}
+
+ERP_tsne = tsne(as.matrix(dplyr::select(ERP_clusterable_data, -y)),
+                k = 3,
+                perplexity = perplx,
+                max_iter = iterations)
+
+
+tsne_stats <- get_Distances(ERP_tsne, 3, ERP_clusterable_data)
+
+distances_plot <- 
+  tsne_stats %>% 
+  ggplot(aes(x=Distance_Origin, fill = Label)) +
+  geom_density(alpha = 0.6) +
+  labs(title = "t-SNE Distance from Origin - ERP Data",
+       subtitle = glue("{dims} dimensional representation of perplexity = {perplx}"),
+       x = "Distance from the Origin",
+       y = "Density") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        text = element_text(size = 18))
+  
+distances_ttest_table <- 
+  tsne_stats %>% 
+  t_test(x= ., 
+         formula = Distance_Origin ~ Label,
+         order = c("Control", "Depressed Patient"),
+         alternative = "less") %>% 
+  mutate_if(is.numeric, round, 3)
+
+# save results to the all_tTest table
+distances_ttest_table %>% 
+  mutate(`Data Set` = "ERP",
+         `Parameter Set` = "all") %>% 
+  select(`Data Set`, `Parameter Set`, everything()) -> distances_ttest_table
+
+all_tTests <- rbind(all_tTests, distances_ttest_table)
+
+
+distances_plot / gridExtra::tableGrob(distances_ttest_table)
+
+```
+
+```{r Peak Distances, fig.height=7, fig.width=7.5, warning=FALSE}
+
+ERP_params <- c("PeakAmp", "Latency")
+ dims <-  3
+for(i in 1:length(ERP_params)){
+  
+  letter <- ERP_params[i]
+  letter
+
+ERP_tsne = tsne(as.matrix(dplyr::select(ERP_clusterable_data, starts_with(letter))),
+                k = 3,
+                perplexity = perplx,
+                max_iter = iterations)
+
+tsne_stats <- get_Distances(ERP_tsne, 3, ERP_clusterable_data)
+
+distances_plot <- 
+  tsne_stats %>% 
+  ggplot(aes(x=Distance_Origin, fill = Label)) +
+  geom_density(alpha = 0.6) +
+  labs(title = glue("t-SNE Distance from Origin - ERP {letter} Data"),
+       subtitle = glue("{dims} dimensional representation; perplexity = {perplx}"),
+       x = "Distance from the Origin",
+       y = "Density") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        text = element_text(size = 18))
+  
+distances_ttest_table <- 
+  tsne_stats %>% 
+  t_test(x= ., 
+         formula = Distance_Origin ~ Label,
+         order = c("Control", "Depressed Patient"),
+         alternative = "less")  %>% 
+  mutate_if(is.numeric, round, 3)
+
+# save results to the all_tTest table
+distances_ttest_table %>% 
+  mutate(`Data Set` = "ERP",
+         `Parameter Set` = letter) %>% 
+  select(`Data Set`, `Parameter Set`, everything()) -> distances_ttest_table
+
+all_tTests <- rbind(all_tTests, distances_ttest_table)
+
+ t_test_density_plot <- distances_plot / gridExtra::tableGrob(distances_ttest_table)
+print(t_test_density_plot)
+
+}
+```
+All t-test results comparing the distance from origin between groups.
+
+```{r present all t test results together cleanly}
+
+all_tTests %>% 
+  select(!alternative) -> all_tTests
+
+knitr::kable(all_tTests)
+  
+
+```
+
+
+
+#### Robustness Check across different Perplexity Values and Embedding Dimensions
+To confirm the results, the above analyses were repeated at different levels of perplexity and different combinations of perplexity and dimension (2 or 3). The results were robust, persisting across most perplexity values. 
+
+A similar robustness check can be conducted for the difference between 2D and 3D embedding. This was conducted at four different levels of perplexity between 10 and 40.
+
+```{r 2D vs 3D robustness check, echo=FALSE, warning=FALSE}
+
+# data_sets
+DCM_params <- c("all", "B", "A", "G", "H", "T")
+
+
+# tSNE parameters
+perplex_list <- seq(from = 10, to = 40, by = 10)
+
+dims_list = c(2, 3)
+
+iterations = 1000
+
+Param_table = expand_grid(Perplexity = perplex_list,
+            Dimensions = dims_list)
+
+
+
+results_table = NULL
+
+for(i in 1:length(DCM_params)){
+  
+  letter <- DCM_params[i]
+  print(letter)
+
+  for(r in seq(1, nrow(Param_table))){
+    
+    if(letter == "all"){
+    DCM_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, !y)),
+                  k = Param_table$Dimensions[r],
+                  perplexity = Param_table$Perplexity[r],
+                  max_iter = iterations,
+                  epoch = 500)
+    }else{
+    DCM_tsne = tsne(as.matrix(dplyr::select(DCM_clusterable_data, starts_with(letter))),
+                    k = Param_table$Dimensions[r],
+                    perplexity = Param_table$Perplexity[r],
+                    max_iter = iterations,
+                    epoch = 500)
+    }
+        
+    tsne_stats <- get_Distances(DCM_tsne, Param_table$Dimensions[r], DCM_clusterable_data)
+  
+    # distances_plot <- 
+    #   tsne_stats %>% 
+    #   ggplot(aes(x=Distance_Origin, fill = Label)) +
+    #   geom_density(alpha = 0.6) +
+    #   labs(title = "t-SNE Distance from Origin - DCM Data",
+    #        subtitle = glue("{dims} dimensional representation of perplexity = {perplx}"),
+    #        x = "Distance from the Origin",
+    #        y = "Density") +
+    #   theme_bw() +
+    #   theme(legend.position = "bottom",
+    #         text = element_text(size = 18))
+      
+    distances_ttest_table <- 
+      tsne_stats %>% 
+      t_test(x= ., 
+             formula = Distance_Origin ~ Label,
+             order = c("Control", "Depressed Patient"),
+             alternative = "less") %>% 
+      mutate(DCM_Parameter = letter,
+             Perplexity = Param_table$Perplexity[r],
+             Dimension = Param_table$Dimensions[r]) %>% 
+      select(Dimension, Perplexity, everything())
+    
+    results_table <- results_table %>% 
+      bind_rows(., distances_ttest_table)
+    
+  }
+}
+  clean_table <- results_table %>% 
+    mutate_if(is.numeric, funs(round(., 3))) %>% 
+    select(DCM_Parameter, everything()) %>% 
+    select(!alternative)
+  
+  
+  
+knitr::kable(clean_table)
+
+```
+
+```{r same for ERP sets}
+
+ERP_params <- c("all", "PeakAmp", "Latency")
+
+dims <-  3
+
+
+perplex_list <- seq(from = 10, to = 40, by = 10)
+
+dims_list = c(2, 3)
+
+iterations = 1000
+
+Param_table = expand_grid(Perplexity = perplex_list,
+            Dimensions = dims_list)
+
+
+
+results_table = NULL
+
+for(i in 1:length(ERP_params)){
+  
+  letter <- ERP_params[i]
+  print(letter)
+
+  for(r in seq(1, nrow(Param_table))){
+    
+    if(letter == "all"){
+    ERP_tsne = tsne(as.matrix(dplyr::select(ERP_clusterable_data, !y)),
+                  k = Param_table$Dimensions[r],
+                  perplexity = Param_table$Perplexity[r],
+                  max_iter = iterations,
+                  epoch = 500)
+    }else{
+    ERP_tsne = tsne(as.matrix(dplyr::select(ERP_clusterable_data, starts_with(letter))),
+                    k = Param_table$Dimensions[r],
+                    perplexity = Param_table$Perplexity[r],
+                    max_iter = iterations,
+                    epoch = 500)
+    }
+        
+    tsne_stats <- get_Distances(ERP_tsne, Param_table$Dimensions[r], ERP_clusterable_data)
+  
+    # distances_plot <- 
+    #   tsne_stats %>% 
+    #   ggplot(aes(x=Distance_Origin, fill = Label)) +
+    #   geom_density(alpha = 0.6) +
+    #   labs(title = "t-SNE Distance from Origin - ERP Data",
+    #        subtitle = glue("{dims} dimensional representation of perplexity = {perplx}"),
+    #        x = "Distance from the Origin",
+    #        y = "Density") +
+    #   theme_bw() +
+    #   theme(legend.position = "bottom",
+    #         text = element_text(size = 18))
+      
+    distances_ttest_table <- 
+      tsne_stats %>% 
+      t_test(x= ., 
+             formula = Distance_Origin ~ Label,
+             order = c("Control", "Depressed Patient"),
+             alternative = "less") %>% 
+      mutate(ERP_Parameter = letter,
+             Perplexity = Param_table$Perplexity[r],
+             Dimension = Param_table$Dimensions[r]) %>% 
+      select(Dimension, Perplexity, everything())
+    
+    results_table <- results_table %>% 
+      bind_rows(., distances_ttest_table)
+    
+  }
+}
+  clean_table <- results_table %>% 
+    mutate_if(is.numeric, funs(round(., 3))) %>% 
+    select(ERP_Parameter, everything()) %>% 
+    select(!alternative)
+  
+  
+  
+knitr::kable(clean_table)
+ 
+```
+
+
+
+
+## UMAP results
+
+```{r umap}
+
+set.seed(321)
+
+dims = 3
+# ERP_umap <- recipe(df_wide, y ~ .) %>% # all features
+ERP_umap <- recipe(ERP_values_top10_wide[, -1], y ~ .) %>% # top10 only
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors()) %>%
+  step_umap(all_predictors(),
+            # outcome = vars(y),
+            neighbors = 5,
+            num_comp = dims,
+            # min_dist = 0.1,
+            epochs = 1000) |> 
+  prep() %>%
+  juice()
+  
+
+ # DCM_umap <- recipe(DCM_df, y ~ .) %>% # all features
+ DCM_umap <- recipe(clusterable_DCM, y ~ .) %>% # top10 only
+  step_zv(all_predictors()) %>% 
+  step_umap(all_predictors(),
+            neighbors = 5,
+            # outcome = vars(y),
+            num_comp = dims,
+            # min_dist = 0.1,
+            epochs = 1000) |>  
+  prep() %>%
+  juice()
+
+
+```
+
+#### Plot results
+
+
+```{r}
+plot_umap <- function(tsne_res, dims, clusterable_data) {
+  
+  if (dims == 2){
+    
+  tsne_plot <- 
+    tsne_res %>%
+    as_tibble(.) %>% 
+    mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient"))) %>% 
+    ggplot(aes(x=UMAP1,
+               y=UMAP2,
+               color = Label)) + 
+    geom_point(size = 2.5) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          text = element_text(size = 18)) +
+    labs(title = glue("UMAP Embeddings of {dataset} feature set"), 
+         subtitle = glue("{dims} dimensional representation"))
+  
+  } else if (dims == 3){
+    
+    mycolors <- c("#296dc0", "#ff5529")
+    
+    tsne_plot <-
+      tsne_res %>% 
+      as_tibble(.) %>%
+      mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient"))) %>% 
+      mutate(Color = mycolors[as.numeric(Label)]) %>%
+      plot3d(x=.$UMAP1, y=.$UMAP2, z=.$UMAP3, 
+      col = .$Color, 
+      type = 's', 
+      size = 0.7,
+      radius = 0.4,
+      xlab="UMAP1", ylab="UMAP2", zlab="UMAP3")
+    
+    rgl_add_axes(x=tsne_res$UMAP1, y=tsne_res$UMAP2, z=tsne_res$UMAP3, show.bbox = TRUE)
+    # movie3d(spin3d(axis = c(0, 0, 1)), duration = 3,
+    #     dir = getwd())
+  }
+  
+  return(tsne_plot)
+  
+}
+```
+
+
+```{r threeD plots}
+dataset = "ERP"
+ERP_cluster <- plot_umap(ERP_umap[, -1], dims, ERP_umap) 
+
+dataset = "DCM"
+DCM_cluster <- plot_umap(DCM_umap[, -1], dims, DCM_umap) 
+
+```
+
+
+```{r twoD plots}
+
+ERP_umap |> 
+  mutate(y = df_wide$y
+         # UMAP3_scale = 10*(UMAP3 - min(UMAP3))/diff(range(UMAP3))
+         ) |> 
+  ggplot(aes(x= UMAP1, y=UMAP2, colour = y)) +
+  geom_point(alpha = 0.5, size = 3) +
+  labs(title = "ERP Embeddings") +
+  theme_classic()
+
+
+DCM_umap |> 
+  mutate(y = df_wide$y
+         # UMAP3_scale = 10*(UMAP3 - min(UMAP3))/diff(range(UMAP3))
+         ) |> 
+  ggplot(aes(x= UMAP1, y=UMAP2, colour = y)) +
+  geom_point(alpha = 0.5, size = 3) +
+  labs(title = "DCM Embeddings") +
+  theme_classic()
+
+```
+
+
+### Clustering without UMAP or t-SNE
+
+```{r kmeans}
+
+library(cluster)
+as.matrix(ERP_values_top10_wide[, 3:12]) -> ERP_top10
+as.matrix(clusterable_DCM[,-1]) -> DCM_top10
+
+
+silhouette_score <- function(k, data=ERP_top10){
+  km <- kmeans(data, centers = k, nstart=25)
+  ss <- silhouette(km$cluster, dist(data))
+  mean(ss[, 3])
+}
+silhouette_sd_score <- 
+  function(k, data=ERP_top10){
+    km <- kmeans(data, centers = k, nstart=25)
+    ss <- silhouette(km$cluster, dist(data))
+    sd(ss[, 3], na.rm = FALSE)
+    }
+
+k <- 2:12
+```
+
+
+```{r kmeans_scores}
+
+ERP_All <- tibble(Participants = "All",
+            Features = "ERP",
+            k = k) |> 
+  mutate(`Avg Silhouette Score` = map_dbl(k,
+                                          ~silhouette_score(.x,
+                                                            data=ERP_top10)),
+         `SD Silhouette Score` = map_dbl(k,
+                                         ~silhouette_sd_score(.x,
+                                                              data=ERP_top10)))
+
+
+ERP_Patients <- tibble(Participants = "Patients",
+            Features = "ERP",
+            k = k) |> 
+  mutate(`Avg Silhouette Score` = map_dbl(k,
+                                          ~silhouette_score(.x, 
+                                                               data=ERP_top10[36:49,])),
+         `SD Silhouette Score` = map_dbl(k,
+                                         ~silhouette_sd_score(.x,
+                                                                 data=ERP_top10[36:49,])))
+
+DCM_All <- tibble(Participants = "All",
+            Features = "DCM",
+            k = k) |> 
+  mutate(`Avg Silhouette Score` = map_dbl(k,
+                                          ~silhouette_score(.x,
+                                                            data=DCM_top10)),
+         `SD Silhouette Score` = map_dbl(k,
+                                         ~silhouette_sd_score(.x,
+                                                              data=DCM_top10)))
+
+DCM_Patients <- tibble(Participants = "Patients",
+            Features = "DCM",
+            k = k) |> 
+  mutate(`Avg Silhouette Score` = map_dbl(k,
+                                          ~silhouette_score(.x,
+                                                            data=DCM_top10[36:49,])),
+         `SD Silhouette Score` = map_dbl(k,
+                                         ~silhouette_sd_score(.x,
+                                                              data=DCM_top10[36:49,])))
+```
+
+
+```{r kmeans_plot}
+
+combined_Avg_Sil_Scores <- 
+  bind_rows(DCM_All, DCM_Patients, ERP_All, ERP_Patients) %>% 
+  mutate(`Std Error` = `SD Silhouette Score`/sqrt(48))
+  
+
+
+SilScorePLot <- combined_Avg_Sil_Scores %>% 
+  ggplot(aes(x = k, 
+             y = `Avg Silhouette Score`, 
+             color = Participants, 
+             linetype = Features,
+             shape = Features)) + 
+  # facet_grid(.~Features) +
+  geom_pointrange(aes(ymin = (`Avg Silhouette Score` - `Std Error`), 
+                      ymax = (`Avg Silhouette Score` + `Std Error`)), position = position_dodge(width = .5)) +
+  geom_line() +
+  guides(linetype = "none") +
+  labs(title = "Mean Silhouette Scores by Features and Participants",
+       y = "Mean Silhouette Score") +
+  scale_x_continuous(breaks = seq(1:13), 
+                     labels = as.character(seq(1:13))) +
+  # scale_y_continuous(breaks = seq(0:0.5, .1),
+                     # expand(0,0)) +
+  theme_classic(base_size = 16)
+
+SilScorePLot
+
+
+```
+
+```{r hdbscan}
+
+library(dbscan)
+as.matrix(ERP_values_top10_wide[, 3:12]) -> ERP_top10
+as.matrix(clusterable_DCM[,-1]) -> DCM_top10
+
+hdb_sil_score <- function(k, data=ERP_top10){
+  km <- hdbscan(data, minPts = k)
+  ss <- silhouette(km$cluster, dist(data))
+  mean(ss[, 3])
+}
+
+hdb_sil_sd_score <- 
+  function(k, data=ERP_top10){
+    km <- hdbscan(data, minPts = k)
+    ss <- silhouette(km$cluster, dist(data))
+    sd(ss[, 3], na.rm = FALSE)
+    }
+
+k <- 3:12
+
+```
+
+```{r hdbscan_score}
+
+ERP_All <- tibble(Participants = "All",
+            Features = "ERP",
+            k = k) |> 
+  mutate(`Avg Silhouette Score` = map_dbl(k,
+                                          ~hdb_sil_score(.x,
+                                                            data=ERP_top10)),
+         `SD Silhouette Score` = map_dbl(k,
+                                         ~hdb_sil_sd_score(.x,
+                                                              data=ERP_top10)))
+
+
+ERP_Patients <- tibble(Participants = "Patients",
+            Features = "ERP",
+            k = k) |> 
+  mutate(`Avg Silhouette Score` = map_dbl(k,
+                                          ~hdb_sil_score(.x, 
+                                                               data=ERP_top10[36:49,])),
+         `SD Silhouette Score` = map_dbl(k,
+                                         ~hdb_sil_sd_score(.x,
+                                                                 data=ERP_top10[36:49,])))
+
+DCM_All <- tibble(Participants = "All",
+            Features = "DCM",
+            k = k) |> 
+  mutate(`Avg Silhouette Score` = map_dbl(k,
+                                          ~hdb_sil_score(.x,
+                                                            data=DCM_top10)),
+         `SD Silhouette Score` = map_dbl(k,
+                                         ~hdb_sil_sd_score(.x,
+                                                              data=DCM_top10)))
+
+DCM_Patients <- tibble(Participants = "Patients",
+            Features = "DCM",
+            k = k) |> 
+  mutate(`Avg Silhouette Score` = map_dbl(k,
+                                          ~hdb_sil_score(.x,
+                                                            data=DCM_top10[36:49,])),
+         `SD Silhouette Score` = map_dbl(k,
+                                         ~hdb_sil_sd_score(.x,
+                                                              data=DCM_top10[36:49,])))
+
+```
+

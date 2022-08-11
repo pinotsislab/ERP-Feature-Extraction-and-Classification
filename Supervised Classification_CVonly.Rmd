@@ -1,0 +1,1301 @@
+---
+title: "Classification MDD with Grid Search"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+```{r Render options, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+
+```
+
+```{r Load Libraries, include=FALSE}
+
+library(tidyverse)
+library(tidymodels)
+library(themis)
+require(data.table)
+
+set.seed(333) 
+# set.seed(333) at kfolds = 9 and including nonERP channels #RF is good!
+theme_set(theme_bw(base_size = 18))
+
+```
+
+# Methods
+## Data
+
+```{r load data, include=FALSE}
+
+# DCM data load
+DCM_df = read_csv("../Data/flat_full_data.csv") %>% 
+  mutate(y = factor(y))
+
+# Only consider certain B features
+good_Bs <- c("B1", "B32", "B43", "B54", "B56", "B65", "B67", "B74", "B76", "B78","B85", "B87", "B89")
+DCM_B_features <- DCM_df %>% select(good_Bs)
+
+DCM_df <- DCM_df %>% 
+  select(-starts_with("B")) %>% 
+  bind_cols(., DCM_B_features)
+
+# Load brain area specific names and merge into DCM labels:
+brain_region_names <- read_csv("../Data/DCM_var_labels.csv")
+DCM_names <- tibble(Parameter = names(DCM_df))
+
+
+DCM_names_matched <- left_join(DCM_names, brain_region_names) %>% 
+  mutate(Meaning = case_when(is.na(Meaning) ~ Parameter,
+                             TRUE ~ Meaning))
+
+names(DCM_df) <- DCM_names_matched$Meaning                  
+
+rm(brain_region_names)
+rm(DCM_names)
+# ERP data load
+ERP_df = read_csv("/home/sean/pCloudDrive/Work/Depression Classification/Data/ERP_results_all_Channels.csv") %>% 
+  mutate(y = case_when(substr(.$SubjID, 1, 2) == "hc" ~ "-1",
+                           substr(.$SubjID, 1, 2) == "pp" ~ "1",
+                           TRUE ~ "NULL")) %>% 
+  mutate(y = factor(y))
+
+nonERP_Channels <- c("HEOG", "VEOG", "ECG")
+
+ERP_wide <- ERP_df %>%
+  select(-MeanAmp_Control, -MeanAmp_Interference) %>% #drop Mean Amplitude features
+  filter(!(Channel %in% nonERP_Channels)) %>% 
+  pivot_wider(names_from = Channel,
+             values_from = c(PeakAmp_Control, PeakAmp_Interference, Latency_Control, Latency_Interference)) %>%
+  dplyr::select(-SubjID, -Component)
+
+desired_num_channels = 23
+
+```
+
+### Sample Size
+Analyses were conducted on data from N = `r nrow(DCM_df)` participants. Two classes of participants exist in the data: depressed patients and control participants. `r table(DCM_df$y)[2]` (`r round(table(DCM_df$y)[[2]]/nrow(DCM_df), 0)`%) were identified as depressed patients, and `r table(DCM_df$y)[1]` were control participants. 
+
+### Feature Sets
+Two data sets of input features were used to predict the participant classes: DCM parameter features and ERP features. DCM and ERP features were estimated independently and used to generate separate predictive models. No observations were missing from either data set (pairwise complete).
+
+The DCM parameters A, B, G, H, and T were were used as predictor features. These parameters were estimated and then flattened to `r ncol(DCM_df)` input features. Only features with non-zero variance were preserved for predictive modeling resulting in 98 input features. No observations were missing in the data.
+
+```{r ERP feature correlations, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+library(corx)
+
+corx(ERP_df[, 4:9],
+     stars = c(0.05, 0.01, 0.001),
+     triangle = "lower", 
+     caption = "Correlations in the ERP data set")
+
+```
+
+ERP features were estimated using Field Trip and Matlab using 60 channels of EEG recordings across two conditions. Epochs from the correct response trials were extracted and parsed according to the component channels. From each channel and trial condition, 
+There is a choice to be made in preprocessing the ERP data. The original data set contains features that are the number of channels (60) x number of conditions (2) x variables (2). The ERP data set contains more features than the DCM data, and therefore must be reduced for fair comparison. The variables remain as Latency and Peak Amplitude and therefore to reduce the dimensionality *a priori* we 1) take the difference in each variable score between conditions (Peak_Amplitude_Difference = PeakAmp_Control - PeakAmp_Interference and
+Latency_Difference = Latency_Control - Latency_Interference)
+
+and 2) limit the number of channels to only those with the strongest relationship with the class label as determined by a naive random forest model (100 trees, no hyper parameter tuning, and no cross validation). The peak amplitude and latency differences for were used as input features and compared using permutation variable importance. The random 
+Ultimately, this method reduces the ERP data features from `r n_distinct(ERP_df$Channel)` channels to a subsample of `r desired_num_channels` channels with 2 features each, an equivalent number of features (98) as the DCM model. The targeted channels are as follows:
+
+```{r Boruta feature importance, message=FALSE, warning=FALSE}
+
+library(Boruta)
+
+# # difference measures
+# ERP_df %>%
+#   group_by(SubjID) %>%
+#   mutate(PeakAmp_Diff = PeakAmp_Control - PeakAmp_Interference,
+#           MeanAmp_Diff = MeanAmp_Control - MeanAmp_Interference,
+#           Latency_Diff = Latency_Control - Latency_Interference) %>%
+#    dplyr::select(SubjID, y, Channel, PeakAmp_Diff, Latency_Diff) %>%
+#    pivot_wider(names_from = Channel,
+#                values_from = c(PeakAmp_Diff, Latency_Diff)) %>%
+#   ungroup() %>%
+#   dplyr::select(-SubjID) %>%
+#   recipe(., y~.) %>%
+#   step_nzv(all_predictors()) %>%
+#   prep() %>%
+#   juice() -> var_select_data
+# 
+
+# all features (no difference measures)
+ERP_wide %>% 
+  recipe(., y~.) %>% 
+  step_nzv(all_predictors()) %>% 
+  prep() %>% 
+  juice() -> var_select_data
+
+ERP_Boruta <- Boruta(y~., data = var_select_data)
+plot(ERP_Boruta)
+
+ERP_Boruta_res <-attStats(ERP_Boruta) %>% arrange(decision) %>% rownames_to_column()
+write_csv(ERP_Boruta_res, "/home/sean/pCloudDrive/Work/Depression Classification/Results/Boruta_ERP.csv")
+
+DCM_Boruta <- Boruta(y~., data = DCM_df)
+plot(DCM_Boruta)
+DCM_Boruta_res <- attStats(DCM_Boruta) %>% arrange(decision) %>% rownames_to_column()
+
+write_csv(DCM_Boruta_res, "/home/sean/pCloudDrive/Work/Depression Classification/Results/Boruta_DCM.csv")
+
+```
+
+
+```{r ERP Channel selection, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+
+# library(corrr)
+# 
+# best_Channels <- ERP_wide %>% 
+#   mutate(y = as.numeric(y)) %>% 
+#   correlate() %>% 
+#   focus(y) %>% 
+#   arrange(desc(abs(y))) %>% 
+#   mutate(Channel = str_split(rowname, "_", simplify = T)[,3]) 
+# 
+# retained_Channels <- best_Channels %>% 
+#   select(Channel) %>% 
+#   distinct(Channel) %>% 
+#   head(desired_num_channels) # for 3 difference score parameters each channel == 99 input features
+# 
+# retained_Channels$Channel
+
+```
+
+```{r alternative channel selection with Random Forest, message=FALSE, warning=FALSE}
+
+ERP_wide %>%
+  recipe(., y~.) %>% 
+  step_nzv(all_predictors()) %>% 
+  prep() %>% 
+  juice() -> var_select_data
+
+library(ranger)
+library(vip)
+ranfor_var_select <- rand_forest(mode = "classification",
+                    trees = 100) %>% 
+  set_engine("ranger", importance = "permutation") %>% 
+  fit(y ~ ., data = var_select_data)
+
+# -- num features selection
+# desired_num_features = 98
+# 
+# retained_Channels <- ranfor_var_select %>% vi() %>% 
+#   mutate(Channel = str_split(Variable, "_", simplify = T)[,3]) %>% 
+#   select(Channel) %>% 
+#   head(98)
+
+#--- num channels selection
+retained_Channels <- ranfor_var_select %>% vi() %>% 
+  mutate(Channel = str_split(Variable, "_", simplify = T)[,3]) %>% 
+  select(Channel) %>% 
+  distinct(Channel) %>% 
+  head(desired_num_channels)
+
+retained_Channels$Channel
+```
+
+
+```{r Reform ERP dataset in light of reduced channel IDs}
+#differnce of vars ---
+# ERP_wide <-  ERP_df %>%
+#   filter(Channel %in% retained_Channels$Channel) %>%
+#   group_by(SubjID) %>%
+#   mutate(PeakAmp_Diff = PeakAmp_Control - PeakAmp_Interference,
+#           MeanAmp_Diff = MeanAmp_Control - MeanAmp_Interference,
+#           Latency_Diff = Latency_Control - Latency_Interference) %>%
+#    dplyr::select(SubjID, y, Channel, PeakAmp_Diff, Latency_Diff) %>% 
+#    pivot_wider(names_from = Channel,
+#                values_from = c(PeakAmp_Diff, Latency_Diff)) %>%
+#   ungroup() %>%
+#   dplyr::select(-SubjID)
+
+ERP_wide <-  ERP_df %>%
+  filter(Channel %in% retained_Channels$Channel) %>%
+  # mutate(PeakAmp_Diff = PeakAmp_Control - PeakAmp_Interference,
+         # MeanAmp_Diff = MeanAmp_Control - MeanAmp_Interference,
+          # Latency_Diff = Latency_Control - Latency_Interference) %>%
+   dplyr::select(SubjID, y, Channel, PeakAmp_Control, PeakAmp_Interference, Latency_Control, Latency_Interference) %>% 
+   pivot_wider(names_from = Channel,
+               values_from = c(PeakAmp_Control, PeakAmp_Interference, Latency_Control, Latency_Interference)) %>%
+  dplyr::select(-SubjID)
+
+```
+
+### Preprocessing
+
+For both the DCM and ERP data sets, participant label (patient = 1, control = -1) was used as the class identifier for binary classification. Given the imbalanced number of observations in the two classes, SMOTE with 2 nearest reference neighbors was used to oversample observations from the patient data to bring the number of patients and controls to parity in the training set (#! Elready and Atiya 2019). Furthermore, only features with non-zero variance were retained for modeling. 
+
+DCM features are normalized *a priori* in the estimation process. However, the ERP features were normalized before modeling.
+
+### Split the data
+
+78% of the data set was used for training and cross-validation. The remaining 22% of the data (10 observations - 7 controls and 3 patients) was reserved as a test set and withheld during model training.
+
+The participant label (patient = 1, control = -1) was used as the class label for binary classification. Given the imbalanced number of observations in the two classes, SMOTE with 2 nearest reference neighbors was used to oversample observations from the training data to bring the number of patients and controls to parity (Elreedy and Atiya 2019). 
+
+
+```{r Preprocessing Steps, include=FALSE}
+# Data for the cross validation steps. Recalculated on every subsample
+
+# normalized on all values because of small sample size, this SHOULD be only the training data
+ERP_preproc_recipe <- recipe(ERP_wide, y ~ .) %>% 
+  step_zv(all_predictors()) %>% 
+  step_smote(y, neighbors = 3) %>% 
+  # step_BoxCox(starts_with("Lat")) %>%
+  step_normalize(all_predictors()) 
+
+
+DCM_preproc_recipe <- recipe(DCM_df, y ~ .) %>% 
+  step_zv(all_predictors()) %>% 
+  step_smote(y, neighbors = 3)
+   
+
+```
+
+```{r Extract the preprocessed data for plotting and post hoc}
+ERP_preproc_recipe %>% prep() %>% juice() -> ERP_df_postProc
+DCM_preproc_recipe %>% prep() %>% juice() -> DCM_df_postProc
+```
+
+
+```{r pseudo-test data without SMOTE}
+
+ERP_noSMOTE <- recipe(ERP_wide, y ~ .) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors()) %>% 
+  prep() %>% 
+  juice()
+
+DCM_noSMOTE <- recipe(DCM_df, y ~ .) %>% 
+  step_zv(all_predictors()) %>% 
+  prep() %>% 
+  juice()
+
+```
+
+## Predictive Modeling for Classification
+
+### Models
+
+Binary classification machine learning models were constructed to determine if participants were patients (1) or controls (-1). The following candidate model architectures were considered and trained:
+
+(1) Support vector machine (SVM) with radial basis function (Cortes and Vapnik 1995)
+(2) Random Forest (RF using ranger) (Breiman 2001; Wright and Ziegler 2017)
+(3) Gradient Boosted Tree (using XGBoost) (Chen and Guestrin 2016)
+(4) Logistic Regression (GLMnet) (Friedman et al. 2010)
+
+
+### Metrics
+
+Model selection was conducted by comparing test-set performance between the models including accuracy, Cohen's Kappa (kap), sensitivity (sens), specificity (spec), *F*-measure (f_meas), and Mathews' Correlation Coefficient (mcc) (Powers 2010).
+
+Accuracy is the correct identification of classes:
+
+$$Accuracy =  \frac{True Positive + True Negative}{\textrm{Number of Predictions}}$$
+
+However, accuracy is not a good metric when imbalanced classes are present, including this data where depressed patients represent only 1/3 of the data. Cohen's Kappa provides a standardization of accuracy with a baseline of the probability of random agreement. Expected random agreement is the probability of selecting a positive class at random based on the initial class distribution.
+
+$$ K = \frac{Accuracy - \textrm{Expected Random Agreement}}{1 - \textrm{Expected Random Agreement}}$$
+
+Sensitivity or recall of a model is the rate of correctly identified positive cases from all positive observations. Specificity is the inverse of recall, or the rate of correctly identified negative cases from all negative observations. The equations for each follows: 
+
+$$Sensitivity = \frac{Pred.Positives}{\textrm{Num. Positive Observations}} $$ 
+
+$$Specificity = \frac{Pred.Negatives}{\textrm{Num. Negative Observations}} $$
+
+The *F*-measure is the harmonic mean of model recall and precision which is an elegant summary, but one that can be skewed by imbalanced classes:
+
+$$ F = \frac{TruePostive}{TruePositive+(FalseNegative+FalsePositive)/2}$$
+
+The Mathew's Correlation Coefficient (mcc) for a model is the correlation between the predicted classes and real classes of observations. This metric works well in cases of class imbalance, even when extended to multiple classes. It is easy to interpret compared to Cohen's Kappa as there is no reference to the expectations of class size, which can vary in resampling and may not be known in the population. 
+
+$$MCC = \frac{TP * TN - FP * FN}{(TP + TN)(TP+ FN)(TN+ FP)(TN+FN)}$$
+
+The following sections present the details of each model based on their training in R using the parsnip package, a table of performance metrics on the test set, and a confusion matrix for the test set.
+
+```{r Metrics to compare, include=FALSE}
+
+binary_metrics <- metric_set(accuracy, kap, sens, spec, f_meas, mcc)
+
+```
+
+```{r Plot Conf Matrix, include=FALSE}
+
+plotConfMat <- function(results_df) {
+  results_df %>% 
+  conf_mat(y, y_hat) %>% 
+  autoplot(., type= "heatmap")
+}
+
+```
+
+```{r Modeling CV setup}
+library(tune)
+
+folds = 10
+## create tuning cross-folds
+ERP_tuning_cvfolds <- vfold_cv(ERP_df_postProc, v = folds, strata = "y")
+DCM_tuning_cvfolds <- vfold_cv(DCM_df_postProc, v = folds, strata = "y")
+
+# # to do parallel processing
+# doParallel::registerDoParallel(cores = 4)
+# doParallel::registerDoSEQ()
+# 
+```
+
+## Methods
+
+Models were fit using `r folds`-fold cross-validation with a stratified sample of the classes across each of the ERP and DCM training data sets. Model hyperparameter tuning was performed with a grid search strategy for all models. Fifty hyperparameter combinations were assessed based on a Latin hypercube assignment of the search space. Hyperparameters were chosen based on the the model with highest Matthew's Correlation Coefficient score average across the training data folds.
+
+The best fitting model was then applied to the test data set for an unbiased metric of model performance. 
+
+# Modeling Results
+
+## Logistic Regression (GLM)
+
+Regularized logistic regression models were fit using the glmnet package in R (Friedman et al. 2010). Penalty value and L1/L2 penalty mixture hyperparameters were constrained between [0,3] and [0,1] respectively.
+
+```{r GLMnet tune ERP, message=FALSE, warning=FALSE}
+
+# glm_mod <- 
+#   logistic_reg(mode = "classification",
+#                         penalty = tune(), 
+#                         mixture = tune()) %>% 
+#   set_engine("glmnet") 
+# 
+# ERP_glm_wf <- 
+#   workflow() %>%
+#   add_recipe(ERP_preproc_recipe) %>%
+#   add_model(glm_mod)
+# 
+# glm_grid <- parameters(ERP_glm_wf) %>% 
+#   update(mixture = mixture(c(0.01, 1)),
+#          penalty = penalty(c(0.01, 3))) %>% 
+#   grid_latin_hypercube(size = 50)
+# 
+# search_res <-
+#   ERP_glm_wf %>% 
+#   tune_grid(
+#     resamples = ERP_tuning_cvfolds,
+#     # To use non-default parameter ranges
+#     grid = glm_grid,
+#     # How to measure performance?
+#     metrics = binary_metrics
+#   )
+# 
+# ERP_GLM_estimates <- search_res %>%
+#   collect_metrics(.) %>%
+#   pivot_wider(names_from = .metric,
+#               values_from = c(mean, std_err))
+# 
+# best_ERP_glm <- show_best(search_res, "f_meas", n = 10)
+# 
+# final_ERP_glm <- 
+#   logistic_reg(mode = "classification",
+#                penalty = best_ERP_glm$penalty[1],
+#                mixture = best_ERP_glm$mixture[1]) %>%
+#   set_engine("glmnet") %>% 
+#   fit(y ~ .,
+#       data = ERP_df_postProc
+#   ) 
+# 
+# predictions <- ERP_noSMOTE %>% 
+#   predict(final_ERP_glm, new_data = .)
+# 
+# ERP_noSMOTE$y_hat <- predictions$.pred_class
+
+```
+
+The ERP GLM model's hyperparameters were a penalty of `r best_ERP_glm$penalty[1]` and a L1/L2 mixture ratio of `r best_ERP_glm$mixture[1]`.
+
+```{r GLMnet tune DCM, message=FALSE, warning=FALSE}
+
+# glm_mod <- logistic_reg(mode = "classification",
+#                      penalty = tune(), 
+#                      mixture = tune()) %>% 
+#   set_engine("glmnet") 
+# 
+# DCM_glm_wf <- 
+#   workflow() %>%
+#   add_recipe(DCM_preproc_recipe) %>%
+#   add_model(glm_mod)
+# 
+# gkm_grid <- parameters(DCM_glm_wf)%>% 
+#   update(mixture = mixture(c(0.01, 1)),
+#          penalty = penalty(c(0.01, 3))) %>% 
+#   grid_latin_hypercube(size = 50)
+# 
+# search_res <-
+#   DCM_glm_wf %>% 
+#   tune_grid(
+#     resamples = DCM_tuning_cvfolds,
+#     # To use non-default parameter ranges
+#     grid = glm_grid,
+#     # How to measure performance?
+#     metrics = binary_metrics
+#   )
+# 
+# DCM_GLM_estimates <- search_res %>%
+#   collect_metrics(.) %>%
+#   pivot_wider(names_from = .metric,
+#               values_from = c(mean, std_err))
+# 
+# best_DCM_glm <- show_best(search_res, "f_meas", n = 10)
+# 
+# final_DCM_glm <- logistic_reg(mode = "classification",
+#                     penalty = best_DCM_glm$penalty[1],
+#                     mixture = best_DCM_glm$mixture[1]) %>%
+#   set_engine("glmnet") %>% 
+#   fit(y ~ .,
+#     data = DCM_df_postProc
+#   ) 
+# 
+# predictions <- DCM_noSMOTE %>% 
+#   predict(final_DCM_glm, new_data = .)
+# 
+# DCM_noSMOTE$y_hat <- predictions$.pred_class
+
+```
+
+The DCM GLM model's hyperparameters were a penalty of `r best_DCM_glm$penalty[1]` and a L1/L2 mixture ratio of `r best_DCM_glm$mixture[1]`.
+
+
+### GLM Performance
+
+The figure below shows the confusion matrix and performance of the best fitting GLM models on the unseen test set data for each data set.
+
+```{r GLM Performance metrics}
+
+# erp_holder <- ERP_noSMOTE %>% 
+#   binary_metrics(truth = y, estimate = y_hat) %>% 
+#   .[, c(1,3)]  %>% 
+#   mutate(Model = "GLM",
+#          Data = "ERP")
+# 
+# dcm_holder <- DCM_noSMOTE %>% 
+#   binary_metrics(truth = y, estimate = y_hat) %>% 
+#   .[, c(1,3)]  %>% 
+#   mutate(Model = "GLM",
+#          Data = "DCM")
+# 
+# Metrics_glm <- rbind(erp_holder, dcm_holder) 
+
+# knitr::kable(Metrics_svm)
+
+```
+
+```{r GLM conf mats, fig.height=5, fig.width=6}
+# library(patchwork)
+# 
+# ERP_GLM_ConfMat <- plotConfMat(ERP_noSMOTE) + labs(title = "GLM Performance - ERP Data")
+# DCM_GLM_ConfMat <- plotConfMat(DCM_noSMOTE) + labs(title = "GLM Performance - DCM Data")
+# 
+# (ERP_GLM_ConfMat + gridExtra::tableGrob(Metrics_glm[1:6, c('.metric', '.estimate')]))/ (DCM_GLM_ConfMat + gridExtra::tableGrob(Metrics_glm[7:12, c('.metric', '.estimate')]))
+
+```
+
+
+## SVM Model
+
+The SVM model was constructed with a radial basis kernel. The default ranges were provided by the Kernlab package in R (Karatzoglou et al. 2004).
+
+```{r SVM ERP hyperparameter tuning, echo=FALSE, message=FALSE, warning=FALSE}
+
+# ERP
+library(kernlab)
+## Create model for tuning
+svm_mod <-
+  svm_rbf(mode = "classification", 
+          cost = tune(),
+          rbf_sigma = tune()) %>%
+  set_engine("kernlab")
+
+## Create workflow for tuning
+ERP_svm_wf <- 
+  workflow() %>%
+  add_formula(y ~ .) %>% 
+  # add_recipe(ERP_preproc_recipe) %>%
+  add_model(svm_mod)
+
+svm_grid <- grid_latin_hypercube(
+  finalize(cost(), ERP_tuning_cvfolds),
+  rbf_sigma(),
+  size = 50
+)
+
+search_res <-
+  ERP_svm_wf %>% 
+  tune_grid(
+    resamples = ERP_tuning_cvfolds,
+    grid = svm_grid,
+    # How to measure performance?
+    metrics = binary_metrics,
+    control_grid(verbose = F)
+  )
+
+ERP_SVM_estimates <- search_res %>%
+  collect_metrics(.) %>%
+  pivot_wider(names_from = .metric,
+              values_from = c(mean, std_err))
+
+best_ERP_svm <- show_best(search_res, "f_meas", n = 10)
+
+final_ERP_svm <- svm_rbf(mode = "classification",
+                    cost = best_ERP_svm$cost[1],
+                    rbf_sigma = best_ERP_svm$rbf_sigma[1]) %>%
+  set_engine("kernlab") %>% 
+  fit(y ~ .,
+    data = ERP_df_postProc
+  ) 
+
+predictions <- ERP_noSMOTE %>% 
+  predict(final_ERP_svm, new_data = .)
+
+ERP_noSMOTE$y_hat <- predictions$.pred_class
+
+```
+
+The ERP SVM model's hyperparameters were a cost of `r best_ERP_svm$cost[1]` and a radial basis function $\sigma$ of `r best_ERP_svm$rbf_sigma[1]`.
+
+```{r SVM DCM hyperparameter tuning, echo=FALSE, message=FALSE, warning=FALSE}
+
+# DCM
+svm_mod <-
+  svm_rbf(mode = "classification", 
+          cost = tune(),
+          rbf_sigma = tune()) %>%
+  set_engine("kernlab")
+## Create workflow for tuning
+DCM_svm_wf <- 
+  workflow() %>%
+  add_formula(y ~ .) %>% 
+  # add_recipe(DCM_preproc_recipe) %>% 
+  add_model(svm_mod)
+  
+
+
+svm_grid <- grid_latin_hypercube(
+  finalize(cost(), DCM_df_train),
+  rbf_sigma(),
+  size = 50
+)
+
+
+DCM_tuning_results <- DCM_svm_wf %>%
+  tune_grid(
+    resamples = DCM_tuning_cvfolds,
+    grid = svm_grid,
+    # How to measure performance?
+    metrics = binary_metrics
+  )
+
+DCM_SVM_estimates <- DCM_tuning_results %>%
+  collect_metrics(.) %>%
+  pivot_wider(names_from = .metric,
+              values_from = c(mean, std_err))
+
+best_DCM_svm <- show_best(DCM_tuning_results, "f_meas", n = 10)
+
+final_DCM_svm <- svm_rbf(mode = "classification",
+                    cost = best_DCM_svm$cost[1],
+                    rbf_sigma = best_DCM_svm$rbf_sigma[1]) %>%
+  # set_engine("ranger", importance = "impurity") %>% # Use impurity
+  set_engine("kernlab") %>% #Use permutation
+  fit(y ~ .,
+    data = DCM_df_postProc
+  ) 
+
+predictions <- DCM_noSMOTE %>% 
+  predict(final_DCM_svm, new_data = .)
+
+DCM_noSMOTE$y_hat <- predictions$.pred_class
+
+```
+
+The DCM SVM model's hyperparameters were a cost of `r best_DCM_svm$cost[1]` and a radial basis function $\sigma$ of `r best_DCM_svm$rbf_sigma[1]`.
+
+### SVM Performance
+
+The figure below shows the confusion matrix and performance of the best fitting SVM models on the unseen test set data for each data set.
+
+```{r SVM Performance metrics, message=FALSE, warning=FALSE}
+
+erp_holder <- ERP_noSMOTE %>% 
+  binary_metrics(truth = y, estimate = y_hat) %>% 
+  .[, c(1,3)]  %>% 
+  mutate(Model = "SVM",
+         Data = "ERP")
+
+dcm_holder <- DCM_noSMOTE %>% 
+  binary_metrics(truth = y, estimate = y_hat) %>% 
+  .[, c(1,3)]  %>% 
+  mutate(Model = "SVM",
+         Data = "DCM")
+
+Metrics_svm <- rbind(erp_holder, dcm_holder)
+
+# knitr::kable(Metrics_svm)
+
+```
+
+
+```{r SVM conf mats, fig.height=5, fig.width=6}
+library(patchwork)
+
+ERP_SVM_ConfMat <- plotConfMat(ERP_noSMOTE) + labs(title = "SVM Performance - ERP Data")
+DCM_SVM_ConfMat <- plotConfMat(DCM_noSMOTE) + labs(title = "SVM Performance - DCM Data")
+
+(ERP_SVM_ConfMat + gridExtra::tableGrob(Metrics_svm[1:6, c('.metric', '.estimate')]))/ (DCM_SVM_ConfMat + gridExtra::tableGrob(Metrics_svm[7:12, c('.metric', '.estimate')]))
+
+```
+
+## Random Forest
+
+Random Forest models were fit using the ranger package in R. Three hyperparameters were tuned: the number of features sampled for each decision tree (mtry), the total number of decision trees (trees), and the minimun number of observations required to make a split or decision node (min_n).  
+
+Hyperparameters were sampled from a constrained search space based on the input features of both data sets:
+mtry ranged from 1 to 97,
+trees ranged from 5 to 50,
+and min_n ranged from 1 to 14.
+
+```{r RF ERP fitting, message=FALSE, warning=FALSE}
+
+## Create model for tuning 
+rf_model <- rand_forest(
+  mode = "classification",
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()) %>% 
+  set_engine("ranger")
+
+## Create workflow for tuning
+ERP_rf_wf <-
+  workflow() %>%
+  add_formula(y ~ .) %>% 
+  # add_recipe(ERP_preproc_recipe) %>% 
+  add_model(rf_model)
+  
+rf_grid <- parameters(ERP_rf_wf) %>% 
+  update(mtry = mtry(c(1L, 90L)),
+         trees = trees(c(5L, 50L)),
+         min_n = min_n(c(1L, 14L))) %>% 
+  grid_latin_hypercube(size = 50)
+
+ERP_tuning_results <- ERP_rf_wf %>% 
+  tune_grid(
+    resamples= ERP_tuning_cvfolds,
+    # To use non-default parameter ranges
+    grid = rf_grid,
+    # How to measure performance?
+    metrics = binary_metrics
+    )
+
+ERP_RF_estimates <- ERP_tuning_results %>% 
+  collect_metrics(.) %>% 
+  pivot_wider(names_from = .metric,
+              values_from = c(mean, std_err))
+
+best_ERP_rfs <- show_best(ERP_tuning_results, "f_meas", n = 10)
+
+final_ERP_rf <- rand_forest(mode = "classification",
+                    mtry = best_ERP_rfs$mtry[1],
+                    trees = best_ERP_rfs$trees[1],
+                    min_n = best_ERP_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "impurity") %>% # Use impurity
+  # set_engine("ranger") %>% #Use permutation
+  fit(y ~ .,
+    data = ERP_df_postProc
+  ) 
+
+predictions <- ERP_noSMOTE %>% 
+  predict(final_ERP_rf, new_data = .)
+
+ERP_noSMOTE$y_hat <- predictions$.pred_class
+
+```
+
+
+The ERP random forest model's hyperparameters were a mtry value of `r best_ERP_rfs$mtry[1]`, `r best_ERP_rfs$trees[1]` total decision trees, and a min_n of `r best_ERP_rfs$min_n[1]`.
+
+
+```{r RF DCM fitting, message=FALSE, warning=FALSE}
+
+## Create model for tuning 
+rf_model <- rand_forest(
+  mode = "classification",
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()) %>% 
+  set_engine("ranger")
+
+## Create workflow for tuning
+DCM_rf_wf <- 
+  workflow() %>%
+  add_formula(y ~ .) %>% 
+  # add_recipe(DCM_preproc_recipe) %>% 
+  add_model(rf_model)
+  
+rf_grid <- parameters(DCM_rf_wf) %>% 
+  update(mtry = mtry(c(1L, 90L)),
+         trees = trees(c(5L, 50L)),
+         min_n = min_n(c(1L, 14L))) %>% 
+  grid_latin_hypercube(size = 50)
+
+DCM_tuning_results <- DCM_rf_wf %>% 
+  tune_grid(
+    resamples= DCM_tuning_cvfolds,
+    # To use non-default parameter ranges
+    grid = rf_grid,
+    # How to measure performance?
+    metrics = binary_metrics
+    )
+
+DCM_RF_estimates <- DCM_tuning_results %>% 
+  collect_metrics(.) %>% 
+  pivot_wider(names_from = .metric,
+              values_from = c(mean, std_err))
+
+best_DCM_rfs <- show_best(DCM_tuning_results, "f_meas", n = 10)
+
+final_DCM_rf <- rand_forest(mode = "classification",
+                    mtry = best_DCM_rfs$mtry[1],
+                    trees = best_DCM_rfs$trees[1],
+                    min_n = best_DCM_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "impurity") %>% # Use impurity
+  # set_engine("ranger") %>% #Use permutation
+  fit(y ~ .,
+    data = DCM_df_postProc
+  ) 
+
+predictions <- DCM_noSMOTE %>% 
+  predict(final_DCM_rf, new_data = .)
+
+DCM_noSMOTE$y_hat <- predictions$.pred_class
+
+```
+
+The DCM random forest model's hyperparameters were a mtry value of `r best_DCM_rfs$mtry[1]`, `r best_DCM_rfs$trees[1]` total decision trees, and a min_n of `r best_DCM_rfs$min_n[1]`.
+
+### Random Forest Model Perforamnce
+
+The figure below shows the confusion matrix and performance of the best fitting RF models on the unseen test set data for each data set.
+
+```{r RF Performance metrics}
+
+erp_holder <- ERP_noSMOTE %>% 
+  binary_metrics(truth = y, estimate = y_hat) %>% 
+  .[, c(1,3)]  %>% 
+  mutate(Model = "RF",
+         Data = "ERP")
+
+dcm_holder <- DCM_noSMOTE %>% 
+  binary_metrics(truth = y, estimate = y_hat) %>% 
+  .[, c(1,3)]  %>% 
+  mutate(Model = "RF",
+         Data = "DCM")
+
+Metrics_rf <- rbind(erp_holder, dcm_holder)
+
+# knitr::kable(Metrics_svm)
+
+```
+
+
+```{r RF conf mats, fig.height=5, fig.width=6}
+library(patchwork)
+
+ERP_RF_ConfMat <- plotConfMat(ERP_noSMOTE) + labs(title = "RF Performance - ERP Data")
+DCM_RF_ConfMat <- plotConfMat(DCM_noSMOTE) + labs(title = "RF Performance - DCM Data")
+
+(ERP_RF_ConfMat + gridExtra::tableGrob(Metrics_rf[1:6, c('.metric', '.estimate')]))/ (DCM_RF_ConfMat + gridExtra::tableGrob(Metrics_rf[7:12, c('.metric', '.estimate')]))
+
+```
+
+
+## Boosted Trees
+
+Gradient boosted tree models were constructed using the XGBoost library in R. These models have a large number of hyperparameters and as such only the most common four were tuned during cross-validation. Three of the four were identical in definition to the random forest model and are defined there. The four hyperparameters and their constraint ranges are:
+mtry ranging from 1 to 97, the number of trees from 5 to 100, the maximum number of decision nodes allowed in a tree (tree_depth) from 3 to 10, and min_n from 1 to 14.   
+
+```{r ERP XGB, echo=FALSE, message=FALSE, warning=FALSE}
+
+library("xgboost")
+## Create model for tuning 
+xgb_model <- boost_tree(
+  mode = "classification",
+  mtry = tune(),
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune()) %>% 
+  set_engine("xgboost")
+
+
+## Create workflow for tuning
+ERP_tree_wf <-
+  workflow() %>%
+  add_formula(y ~ .) %>% 
+  # add_recipe(ERP_preproc_recipe) %>% 
+  add_model(xgb_model)
+  
+xgb_grid <- parameters(ERP_tree_wf) %>%
+  update(mtry = mtry(c(1L, 90)),
+         trees = trees(c(5L, 100L)),
+         min_n = min_n(c(1L, 14L)),
+         learn_rate = learn_rate(c(0.1, 0.3)),
+         tree_depth = tree_depth(c(3L, 10L))) %>% 
+  grid_latin_hypercube(size = 50)
+  
+ERP_tree_tuning_results <- ERP_tree_wf %>% 
+  tune_grid(
+    resamples=ERP_tuning_cvfolds,
+    grid = xgb_grid,
+    # Generate five at semi-random to start
+    # How to measure performance?
+    metrics = binary_metrics
+    )
+
+ERP_tree_estimates <- ERP_tree_tuning_results %>% 
+  collect_metrics(.) %>% 
+  pivot_wider(names_from = .metric,
+              values_from = c(mean, std_err))
+
+best_ERP_trees <- show_best(ERP_tree_tuning_results, metric = "mcc", n = 10)
+
+final_ERP_tree <- boost_tree(mode = "classification",
+                    mtry = best_ERP_trees$mtry[1],
+                    trees = best_ERP_trees$trees[1],
+                    tree_depth = best_ERP_trees$tree_depth[1],
+                    min_n = best_ERP_trees$min_n[1]) %>%
+  set_engine("xgboost") %>% #Use permutation
+  fit(y ~ .,
+    data = ERP_df_postProc) 
+
+predictions <- ERP_noSMOTE %>% 
+  predict(final_ERP_tree, new_data = .)
+
+ERP_noSMOTE$y_hat <- predictions$.pred_class
+
+```
+
+The final ERP XGB model's hyperparameters were a mtry value of `r best_ERP_trees$mtry[1]`, `r best_ERP_trees$trees[1]` total decision trees with a maximum depth of `r best_ERP_trees$tree_depth[1]`, and a min_n of `r best_ERP_trees$min_n[1]`.
+
+
+```{r DCM XGB, message=FALSE, warning=FALSE}
+xgb_model <- boost_tree(
+  mode = "classification",
+  mtry = tune(),
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune()) %>% 
+  set_engine("xgboost")
+
+
+## Create workflow for tuning
+DCM_tree_wf <- 
+  workflow() %>%
+  add_formula(y ~ .) %>% 
+  # add_recipe(DCM_preproc_recipe) %>% 
+  add_model(xgb_model)
+
+
+xgb_grid <- parameters(DCM_tree_wf) %>%
+  update(mtry = mtry(c(1L, 90)),
+         trees = trees(c(5L, 100L)),
+         min_n = min_n(c(1L, 14L)),
+         learn_rate = learn_rate(c(0.1, 0.3)),
+         tree_depth = tree_depth(c(3L, 10L))) %>%  
+  grid_latin_hypercube(size = 50)
+
+DCM_tree_tuning_results <- DCM_tree_wf %>% 
+  tune_grid(
+    resamples= DCM_tuning_cvfolds,
+    # To use non-default parameter ranges
+    grid = xgb_grid,
+    # How to measure performance?
+    metrics = binary_metrics
+   )
+
+DCM_tree_estimates <- DCM_tree_tuning_results %>% 
+  collect_metrics(.) %>% 
+  pivot_wider(names_from = .metric,
+              values_from = c(mean, std_err))
+
+best_DCM_trees <- show_best(DCM_tree_tuning_results, "f_meas", n = 10)
+
+final_DCM_tree <- boost_tree(mode = "classification",
+                    mtry = best_DCM_trees$mtry[1],
+                    trees = best_DCM_trees$trees[1],
+                    min_n = best_DCM_trees$min_n[1],
+                    tree_depth = best_DCM_trees$tree_depth[1]) %>%
+  set_engine("xgboost") %>% #Use permutation
+  fit(y ~ .,
+    data = DCM_df_postProc
+  ) 
+
+predictions <- DCM_noSMOTE %>% 
+  predict(final_DCM_tree, new_data = .)
+
+DCM_noSMOTE$y_hat <- predictions$.pred_class
+
+```
+
+The DCM XGB model's hyperparameters were a mtry value of `r best_DCM_trees$mtry[1]`, `r best_DCM_trees$trees[1]` total decision trees with a maximum depth of `r best_DCM_trees$tree_depth[1]`, and a min_n of `r best_DCM_trees$min_n[1]`.
+
+### Boosted Tree Performance
+
+The figure below shows the confusion matrix and performance of the best fitting XGB models on the unseen test set data for each data set.
+
+```{r XGB Performance metrics}
+
+erp_holder <- ERP_noSMOTE %>% 
+  binary_metrics(truth = y, estimate = y_hat) %>% 
+  .[, c(1,3)]  %>% 
+  mutate(Model = "XGB",
+         Data = "ERP")
+
+dcm_holder <- DCM_noSMOTE %>% 
+  binary_metrics(truth = y, estimate = y_hat) %>% 
+  .[, c(1,3)]  %>% 
+  mutate(Model = "XGB",
+         Data = "DCM")
+
+Metrics_xgb <- rbind(erp_holder, dcm_holder)
+
+# knitr::kable(Metrics_xgb)
+
+```
+
+
+```{r XGB conf mats, fig.height=5, fig.width=6}
+library(patchwork)
+
+ERP_XGB_ConfMat <- plotConfMat(ERP_noSMOTE) + labs(title = "XGB Performance - ERP Data")
+DCM_XGB_ConfMat <- plotConfMat(DCM_noSMOTE) + labs(title = "XGB Performance - DCM Data")
+
+(ERP_XGB_ConfMat + gridExtra::tableGrob(Metrics_xgb[1:6, c('.metric', '.estimate')]))/ (DCM_XGB_ConfMat + gridExtra::tableGrob(Metrics_xgb[7:12, c('.metric', '.estimate')]))
+
+```
+
+# Model Comparisons
+
+Overall model comparison results show that random forest models performed best with the caveat that no model performed well at specifying the depressed patients using the ERP data set. The random forest and XGBoost tree models performed better than the regularized GLM and SVM models for both data sets. For the DCM data, the random forest performed perfectly in identifying the holdout test data. 
+
+The figure below shows the test-set performance (y-axis) for both the ERP and DCM data sets (x-axis) across all considered metrics and grouped by model architecture. 
+
+```{r Compare all models, fig.height=4, fig.width=8, message=FALSE, warning=FALSE}
+# 
+# Metrics_all <- rbind(Metrics_glm, 
+#                      Metrics_svm, 
+#                      Metrics_rf,
+#                      Metrics_xgb)
+
+Metrics_all <- rbind(Metrics_svm, 
+                     Metrics_rf,
+                     Metrics_xgb)
+
+score_comparison_plot <-  
+  ggplot(Metrics_all, aes(x = Data, y = .estimate, fill = .metric)) +
+  facet_wrap(.~Model) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_bw() +
+  labs(title = "Model Performance Comparison - without SMOTE data",
+       subtitle = "Higher is better",
+       y = "Score",
+       x = "Data Set") +
+  theme(axis.ticks.x.top = element_line(size =1),
+        axis.ticks.x.bottom = element_line(size =1),
+        legend.position = "bottom")
+score_comparison_plot
+
+```
+
+For comparison of model performance across the 9-fold cross-validation results, the mean values of all performance metrics were computed for each set of hyperparameters across each fold. 
+
+```{r Comparison of CrossValidation results}
+DCM_best_tree <- 
+DCM_tree_estimates  %>% 
+  arrange(desc(mean_mcc)) %>% 
+  head(1) %>% 
+  mutate(Data = "DCM",
+         Model = "XGB") %>% 
+  select(Data, Model, n:std_err_spec)
+
+DCM_best_rf <- 
+DCM_RF_estimates %>% 
+  arrange(desc(mean_mcc)) %>% 
+  head(1) %>% 
+  mutate(Data = "DCM",
+         Model = "RF") %>% 
+  select(Data, Model, n:std_err_spec)
+
+DCM_best_svm <- 
+DCM_SVM_estimates %>% 
+  arrange(desc(mean_mcc)) %>% 
+  head(1) %>% 
+  mutate(Data = "DCM",
+         Model = "SVM") %>% 
+  select(Data, Model, n:std_err_spec)
+
+# DCM_best_glm <- 
+# DCM_GLM_estimates %>% 
+#   arrange(desc(mean_mcc)) %>% 
+#   head(1) %>% 
+#   mutate(Data = "DCM",
+#          Model = "GLM") %>% 
+#   select(Data, Model, n:std_err_spec)
+
+
+# ERP
+ERP_best_tree <- 
+ERP_tree_estimates  %>% 
+  arrange(desc(mean_mcc)) %>% 
+  head(1) %>% 
+  mutate(Data = "ERP",
+         Model = "XGB") %>% 
+  select(Data, Model, n:std_err_spec)
+
+ERP_best_rf <- 
+ERP_RF_estimates %>% 
+  arrange(desc(mean_mcc)) %>% 
+  head(1) %>% 
+  mutate(Data = "ERP",
+         Model = "RF") %>% 
+  select(Data, Model, n:std_err_spec)
+
+ERP_best_svm <- 
+ERP_SVM_estimates %>% 
+  arrange(desc(mean_mcc)) %>% 
+  head(1) %>% 
+  mutate(Data = "ERP",
+         Model = "SVM") %>% 
+  select(Data, Model, n:std_err_spec)
+
+# ERP_best_glm <- 
+# ERP_GLM_estimates %>% 
+#   arrange(desc(mean_mcc)) %>% 
+#   head(1) %>% 
+#   mutate(Data = "ERP",
+#          Model = "GLM") %>% 
+#   select(Data, Model, n:std_err_spec)
+
+cv_results <- bind_rows(DCM_best_tree, 
+          DCM_best_rf,
+          DCM_best_svm,
+          # DCM_best_glm,
+          ERP_best_tree, 
+          ERP_best_rf,
+          ERP_best_svm)
+          # ERP_best_glm)
+
+cv_results %>% 
+  select(Data, Model, everything(), -n, -.config) %>% 
+  mutate(across(is_numeric, round, 3))
+
+cv_results %>% 
+  select(Data, Model, mean_mcc, std_err_mcc) %>% 
+  mutate(y_upper = mean_mcc + std_err_mcc,
+         y_lower = mean_mcc - std_err_mcc) %>% 
+  mutate(., across(is_numeric, round, 3)) %>%
+  ggplot(aes(x=Model)) +
+  facet_grid(.~Data) +
+  geom_bar(aes(y = mean_mcc, color = Model, fill = Model), stat = "identity", alpha=0.7) + 
+  geom_errorbar(aes(y = mean_mcc, ymax = y_upper, ymin = y_lower), width = 0.5) +
+  guides(color = F, fill = F) +
+  labs(title = "Cross-Validation Results across 10-folds",
+       subtitle = "Average MCC +/- 1 std. err.",
+       y = "Mean MCC") +
+  theme_bw() 
+
+```
+
+
+
+# Feature Importance in Random Forest Models
+
+The best random forest models for both the ERP and DCM data sets were used to compute feature importance. Two methods were used, Gini impurity and Permutation. 
+
+Gini impurity refers to the probability of incorrectly classifying a data point at a decision node. Each decision node is a split in the data based on a single feature. The weighted average of the Gini impurity across all nodes across all trees that split using the same variable creates a measure of information gain for that particular variable (technically the mean decrease in impurity). The weighted average is important here as nodes that are responsible for segregating more data are deemed more important, even if the probability of correct identification is not necessarily higher. This method can be prone to inflation when the model is not accurate or overfits the training data and utilizes numeric features with many split points (Nembrini et al. 2018).
+
+Permutation importance is calculated similar to leave-one-out cross-validation. Each feature in turn is altered or replaced with random inputs. The resulting effect on the prediction accuracy as scored by a difference from baseline, reflects the relative importance of the feature. Features that affect accuracy more, are more important. 
+
+
+```{r Variable Importance plots and Tables}
+library(vip)
+# impurity importance
+DCM_rf_VarImpurities <- rand_forest(mode = "classification",
+                    mtry = best_DCM_rfs$mtry[1],
+                    trees = best_DCM_rfs$trees[1],
+                    min_n = best_DCM_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "impurity") %>% 
+  fit(y ~ .,
+    data = DCM_df_postProc
+  ) %>%
+  vi() %>% 
+  mutate(Impurity = Importance) %>% 
+  select(-Importance)
+
+ERP_rf_VarImpurities <-  rand_forest(mode = "classification",
+                    mtry = best_ERP_rfs$mtry[1],
+                    trees = best_ERP_rfs$trees[1],
+                    min_n = best_ERP_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "impurity") %>% # Use impurity
+  # set_engine("ranger") %>% #Use permutation
+  fit(y ~ .,
+    data = ERP_df_postProc
+  ) %>% 
+  vi() %>% 
+  mutate(Impurity = Importance) %>% 
+  select(-Importance)
+# permutation importance
+
+DCM_rf_VarPermutations <- rand_forest(mode = "classification",
+                    mtry = best_DCM_rfs$mtry[1],
+                    trees = best_DCM_rfs$trees[1],
+                    min_n = best_DCM_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "permutation") %>% 
+  fit(y ~ .,
+    data = DCM_df_postProc
+  ) %>%
+  vi() %>% 
+  mutate(Permutation = Importance) %>% 
+  select(-Importance)
+
+ERP_rf_VarPermutations <- rand_forest(mode = "classification",
+                    mtry = best_ERP_rfs$mtry[1],
+                    trees = best_ERP_rfs$trees[1],
+                    min_n = best_ERP_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "permutation") %>% # Use impurity
+  # set_engine("ranger") %>% #Use permutation
+  fit(y ~ .,
+    data = ERP_df_postProc
+  ) %>% 
+  vi() %>% 
+  mutate(Permutation = Importance) %>% 
+  select(-Importance)
+
+```
+
+The features from the ERP data set are shown in the table below, listed in descending order of Permutation Importance.
+
+### ERP Feature Importance Values
+```{r Present the variable importances - ERP}
+
+ERP_VI <- ERP_rf_VarImpurities %>% 
+  left_join(., ERP_rf_VarPermutations, by = "Variable") %>% 
+  mutate(Channel = str_split(Variable, "_", simplify = T)[,3],
+         Condition = str_split(Variable, "_", simplify = T)[,2], 
+        `ERP Variable` = str_split(Variable, "_", simplify = T)[,1]) %>% 
+  select(Channel, Condition, `ERP Variable` , Impurity, Permutation) %>% 
+  mutate_if(is_numeric, round, 4) %>% 
+  # arrange(desc((rank(Permutation)+rank(Impurity)/2)))
+  arrange(desc(Permutation))
+
+# write_csv(ERP_VI, "/home/sean/pCloudDrive/Work/Depression Classification/Results/ERP_VarImp_Table.csv")
+
+knitr::kable(ERP_VI)
+
+
+```
+
+The features from the DCM data set are shown in the table below, listed in descending order of Permutation Importance. These values higher on average due to the better accuracy of the DCM random forest model. The results highlight the importance of the B parameter in splitting depressed patients from control participants, particularly B23, B11, B12, B21, B97, B96, B34, and B54. B45 should also be considered as it shows a large impurity score, along with A165, A244, A222, and T14. 
+
+### DCM Feature Importance Values
+```{r Present the variable importances - DCM}
+
+DCM_VI <- DCM_rf_VarImpurities %>% 
+  left_join(., DCM_rf_VarPermutations, by = "Variable") %>% 
+  # arrange(desc((rank(Permutation)+rank(Impurity)/2)))
+  mutate_if(is_numeric, round, 4) %>%
+  arrange(desc(Permutation))
+
+write_csv(DCM_VI, "/home/sean/pCloudDrive/Work/Depression Classification/Results/DCM_VarImp_Table.csv")
+
+
+knitr::kable(DCM_VI)
+
+```
+
+## Combined Plot of Feature Importance
+
+```{r VIPs, fig.height=9, fig.width=8}
+
+DCM_impurity_plot <- rand_forest(mode = "classification",
+                    mtry = best_DCM_rfs$mtry[1],
+                    trees = best_DCM_rfs$trees[1],
+                    min_n = best_DCM_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "impurity") %>% 
+  fit(y ~ .,
+    data = DCM_df_postProc
+  ) %>% 
+  vip() + labs(title = "DCM",
+               y = "Impurity Score")
+
+ERP_impurity_plot <- rand_forest(mode = "classification",
+                    mtry = best_ERP_rfs$mtry[1],
+                    trees = best_ERP_rfs$trees[1],
+                    min_n = best_ERP_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "impurity") %>% # Use impurity
+  # set_engine("ranger") %>% #Use permutation
+  fit(y ~ .,
+    data = ERP_df_postProc
+  ) %>%  vip() + labs(title = "ERP",
+               y = "Impurity Score")
+
+DCM_permutation_plot <- rand_forest(mode = "classification",
+                    mtry = best_DCM_rfs$mtry[1],
+                    trees = best_DCM_rfs$trees[1],
+                    min_n = best_DCM_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "permutation") %>% 
+  fit(y ~ .,
+    data = DCM_df_postProc
+  ) %>%
+  vip() + labs(title = "DCM",
+               y = "Permutation Score")
+
+ERP_permutation_plot <- rand_forest(mode = "classification",
+                    mtry = best_ERP_rfs$mtry[1],
+                    trees = best_ERP_rfs$trees[1],
+                    min_n = best_ERP_rfs$min_n[1]) %>%
+  set_engine("ranger", importance = "permutation") %>% # Use impurity
+  # set_engine("ranger") %>% #Use permutation
+  fit(y ~ .,
+    data = ERP_df_postProc
+  ) %>% 
+  vip() + labs(title = "ERP",
+               y = "Permutation Score")
+
+(ERP_impurity_plot + ERP_permutation_plot) / (DCM_impurity_plot + DCM_permutation_plot) + plot_annotation(tag_levels = 'A')
+
+```
+
+Figure A shows the top ERP features (Variable_Diff_Channel) according to Gini impurity. Figure B shows the top ERP features (Variable_Diff_Channel) according to permutation score. Figure C shows the top DCM features by Gini impurity. Figure D shows the top DCM features by permutation score.
+
+```{r correlation between the feature importance values between methods}
+
+ERP_vi_cor <- cor(x=ERP_VI$Permutation, y=ERP_VI$Impurity, use = "everything", method = "spearman")
+
+DCM_vi_cor <- cor(x=DCM_VI$Permutation, y= DCM_VI$Impurity, use = "everything", method = "spearman")
+
+```
+
+To check the convergence of these two feature importance methods, spearman rank correlations between Impurity and Permutation importance scores were conducted. 
+The spearman correlation between the ERP feature importance values is `r ERP_vi_cor`. The spearman correlation between the DCM feature importance values is `r DCM_vi_cor`. Again, the higher correlation is indicative of a better fitting model for the DCM data.
+
+
+## SVM feature importance for DCM data
+
+```{r}
+
+library(e1071)
+
+fit2 <- svm(y ~ ., data = select(DCM_noSMOTE, -starts_with("y_hat")))
+w <- t(fit2$coefs) %*% fit2$SV                 # weight vectors
+w <- apply(w, 2, function(v){sqrt(sum(v^2))})  # weight
+w <- sort(w, decreasing = T)
+print(w)
+
+```
+

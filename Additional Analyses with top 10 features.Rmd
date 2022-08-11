@@ -1,0 +1,825 @@
+---
+title: "Additional plotting for top 10 features (by SHAP)"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(recipes)
+
+library(tsne)
+
+library(glue)
+library(rgl)
+
+library(patchwork)
+ 
+set.seed(321)
+```
+
+#### Load Data
+```{r}
+
+ERP_SHAP_df <- read_csv('/home/sean/pCloudDrive/Work/Depression Classification/Python Code for Shapley Values/ERP_SHAP_meanSD.csv')
+DCM_SHAP_df <- read_csv('/home/sean/pCloudDrive/Work/Depression Classification/Python Code for Shapley Values/DCM_SHAP_meanSD.csv')
+
+```
+
+
+```{r}
+
+top10_DCM <- 
+  DCM_SHAP_df %>% 
+  pivot_wider(names_from = class, values_from = c(mean, sd)) %>%  
+  mutate(SHAP_mean = mean_0 + mean_1,
+         SHAP_sd = (sd_0 + sd_1)/2) %>% 
+  mutate(SHAP_min = SHAP_mean-SHAP_sd,
+         SHAP_max = SHAP_mean+SHAP_sd)%>%
+  arrange(desc(SHAP_mean)) %>% 
+  head(10)
+
+
+top10_ERP <- 
+  ERP_SHAP_df %>% 
+  pivot_wider(names_from = class, values_from = c(mean, sd)) %>%  
+  mutate(SHAP_mean = mean_0 + mean_1,
+         SHAP_sd = (sd_0 + sd_1)/2) %>% 
+  mutate(SHAP_min = SHAP_mean-SHAP_sd,
+         SHAP_max = SHAP_mean+SHAP_sd)%>%
+  arrange(desc(SHAP_mean)) %>% 
+  head(10)
+```
+
+
+
+```{r}
+
+DCM_top10_Parmeter_Labels_Names <- 
+  read_csv("/home/sean/pCloudDrive/Work/Depression Classification/Data/DCM_top10_Parmeter_Labels_Names.csv")
+
+```
+
+```{r}
+DCM_df = read_csv("../Data/flat_full_data.csv") %>% 
+  mutate(y = factor(y))
+
+# Only consider certain B features
+good_Bs <- c("B1", "B32", "B43", "B54", "B56", "B65", "B67", "B74", "B76", "B78","B85", "B87", "B89")
+DCM_B_features <- DCM_df %>% select(all_of(good_Bs))
+
+DCM_df <- DCM_df %>% 
+  select(-starts_with("B")) %>% 
+  bind_cols(., DCM_B_features)
+
+# ERP features
+
+ERP_df = read_csv("/home/sean/pCloudDrive/Work/Depression Classification/Data/ERP_results_all_Channels.csv") %>% 
+  mutate(y = case_when(substr(.$SubjID, 1, 2) == "hc" ~ "-1",
+                           substr(.$SubjID, 1, 2) == "pp" ~ "1",
+                           TRUE ~ "NULL")) %>% 
+  mutate(y = factor(y))
+```
+
+
+```{r}
+
+peakAmp_ofInterest <- 
+  ERP_df %>% 
+  pivot_longer(cols = starts_with("PeakAmp"), names_to = "name", values_to = "value") %>% 
+  unite(col = feature, c("name", "Channel"), sep =  "_") %>% 
+  select(SubjID,feature, y, value) %>% 
+  filter(feature %in% top10_ERP$feature)
+
+latency_ofInterest <- 
+  ERP_df %>% 
+  pivot_longer(cols = starts_with("Latency"), names_to = "name", values_to = "value") %>% 
+  unite(col = feature, c("name", "Channel"), sep =  "_") %>% 
+  select(SubjID, feature, y, value) %>% 
+  filter(feature %in% top10_ERP$feature)
+
+ERP_values_top10_long <- bind_rows(latency_ofInterest, peakAmp_ofInterest)
+  
+ERP_values_top10_wide <-   
+  ERP_values_top10_long %>% 
+  pivot_wider(id_cols = c(SubjID, y), names_from = feature, values_from = value)
+
+```
+
+
+```{r}
+DCM_df %>% 
+  mutate(row = row_number()) %>% 
+  pivot_longer(-c(y, row)) %>% 
+  filter(name %in% DCM_top10_Parmeter_Labels_Names$Parameter_Label) -> Long_DCM10
+
+Long_DCM10 %>% 
+  pivot_wider(id_cols = c(y, row),names_from = name, values_from = value) %>% 
+  select(-row) -> clusterable_DCM
+
+  
+```
+
+
+
+```{r}
+
+ERP_clusterable_data <- recipe(ERP_values_top10_wide[,-1], y ~ .) %>% 
+  step_zv(all_predictors()) %>% 
+  # step_smote(y, neighbors = 2) %>% 
+  # step_log(all_predictors(),
+  step_normalize(all_predictors()) %>%
+  prep() %>%
+  juice()
+  
+
+
+```
+
+
+
+## tSNE for top 10 features only
+```{r}
+
+plot_tSNE <- function(tsne_res, dims, clusterable_data) {
+  
+  if (dims == 2){
+    
+  tsne_plot <- 
+    tsne_res %>%
+    as_tibble(.) %>% 
+    mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient"))) %>% 
+    ggplot(aes(x=V1,
+               y=V2,
+               color = Label)) + 
+    geom_point(size = 2.5) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          text = element_text(size = 18)) +
+    labs(title = glue("t-SNE Clustering on {dataset} feature set"), 
+         subtitle = glue("{dims} dimensional representation of perplexity = {perplx}"))
+  
+  } else if (dims == 3){
+    
+    mycolors <- c("#F8766D", "#00BFC4")
+    tsne_plot <-
+      tsne_res %>% 
+      as_tibble(.) %>%
+      mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient"))) %>% 
+      mutate(Color = mycolors[as.numeric(Label)]) %>%
+      plot3d(x=.$V1, y=.$V2, z=.$V3, 
+      col = .$Color, 
+      type = 's', 
+      size = 4.5,
+      radius = 4.5,
+      xlab="V1", ylab="V2", zlab="V3")
+    
+  }
+  
+  return(tsne_plot)
+  
+}
+
+```
+
+```{r}
+
+perplx = 25
+dims = 3 # 2 or 3 dimensional plot
+iterations = 2500
+
+```
+
+
+```{r}
+
+
+
+DCM_tsne = tsne(as.matrix(dplyr::select(clusterable_DCM, -y)),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations,
+                epoch = 500)
+
+```
+
+
+```{r}
+
+# dataset = "ERP"
+# ERP_cluster <- plot_tSNE(ERP_tsne, dims, ERP_clusterable_data) 
+
+dataset = "DCM"
+DCM_cluster <- plot_tSNE(DCM_tsne, dims, clusterable_DCM)
+
+# DCM_cluster
+DCM_cluster 
+
+```
+
+```{r}
+library(cluster)
+
+silhouette_score <- function(k){
+  km <- kmeans(DCM_tsne, centers = k, nstart=25)
+  ss <- silhouette(km$cluster, dist(DCM_tsne))
+  mean(ss[, 3])
+}
+
+silhouette_sd_score <- 
+  function(k){
+    km <- kmeans(DCM_tsne, centers = k, nstart=25)
+    ss <- silhouette(km$cluster, dist(DCM_tsne))
+    sd(ss[, 3], na.rm = FALSE)
+    }
+
+k <- 2:12
+avg_sil <- sapply(k, silhouette_score)
+sd_sil <- sapply(k, silhouette_sd_score)
+
+
+DCM_All <- tibble(Participants = "All",
+            Features = "DCM",
+            k = k,
+            `Avg Silhouette Score` = avg_sil,
+            `SD Silhouette Score` = sd_sil)
+
+plot(k, type='b', avg_sil, xlab='Number of clusters', ylab='Average Silhouette Scores', frame=FALSE)
+```
+
+
+```{r}
+
+library(cluster)
+
+silhouette_score <- function(k){
+  km <- kmeans(DCM_tsne[36:49,], centers = k, nstart=25)
+  ss <- silhouette(km$cluster, dist(DCM_tsne[36:49,]))
+  mean(ss[, 3])
+}
+
+silhouette_sd_score <- 
+  function(k){
+    km <- kmeans(DCM_tsne[36:49,], centers = k, nstart=25)
+    ss <- silhouette(km$cluster, dist(DCM_tsne[36:49,]))
+    sd(ss[, 3], na.rm = FALSE)
+    }
+
+k <- 2:12
+avg_sil <- sapply(k, silhouette_score)
+sd_sil <- sapply(k, silhouette_sd_score)
+
+
+DCM_Patients <- tibble(Participants = "Patient",
+            Features = "DCM",
+            k = k,
+            `Avg Silhouette Score` = avg_sil,
+            `SD Silhouette Score` = sd_sil)
+
+plot(k, type='b', avg_sil, xlab='Number of clusters', ylab='Average Silhouette Scores', frame=FALSE)
+
+```
+
+
+```{r}
+library(cluster)
+
+silhouette_score <- function(k){
+  km <- kmeans(DCM_tsne[1:35,], centers = k, nstart=25)
+  ss <- silhouette(km$cluster, dist(DCM_tsne[1:35,]))
+  mean(ss[, 3])
+}
+
+silhouette_sd_score <- 
+  function(k){
+    km <- kmeans(DCM_tsne[1:35,], centers = k, nstart=25)
+    ss <- silhouette(km$cluster, dist(DCM_tsne[1:35,]))
+    sd(ss[, 3], na.rm = FALSE)
+    }
+
+k <- 2:12
+avg_sil <- sapply(k, silhouette_score)
+sd_sil <- sapply(k, silhouette_sd_score)
+
+DCM_Controls <- tibble(Participants = "Control",
+            Features = "DCM",
+            k = k,
+            `Avg Silhouette Score` = avg_sil,
+            `SD Silhouette Score` = sd_sil)
+
+plot(k, type='b', avg_sil, xlab='Number of clusters', ylab='Average Silhouette Scores', frame=FALSE)
+
+```
+
+
+
+```{r}
+km <- kmeans(DCM_tsne[36:49,], centers = 2, nstart=25)
+
+label_vec <-  c(rep(0, 35), km$cluster)
+
+
+plot_tSNE_3classes <- function(tsne_res, dims, clusterable_data) {
+  
+  if (dims == 2){
+    
+  tsne_plot <- 
+    tsne_res %>%
+    as_tibble(.) %>% 
+    mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient - 1", "Depressed Patient - 2")))%>% 
+    ggplot(aes(x=V1,
+               y=V2,
+               color = Label)) + 
+    geom_point(size = 2.5) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          text = element_text(size = 18)) +
+    labs(title = glue("t-SNE Clustering on {dataset} feature set"), 
+         subtitle = glue("{dims} dimensional representation of perplexity = {perplx}"))
+  
+  } else if (dims == 3){
+    
+    mycolors <- c('oldlace', 'royalblue1', 'orange2')
+    tsne_plot <-
+      tsne_res %>% 
+      as_tibble(.) %>%
+      mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient - 1", "Depressed Patient - 2")))%>% 
+      mutate(Color = mycolors[as.numeric(Label)]) %>%
+      plot3d(x=.$V1, y=.$V2, z=.$V3, 
+      col = .$Color, 
+      type = 's', 
+      size = 4.5,
+      radius = 4.5,
+      xlab="V1", ylab="V2", zlab="V3")
+    
+  }
+  
+  return(tsne_plot)
+  
+}
+km
+clusterable_DCM %>% 
+  mutate(y = as.factor(label_vec)) %>% 
+  plot_tSNE_3classes(DCM_tsne, dims, .)
+```
+
+```{r}
+
+km <- kmeans(DCM_tsne[1:35,], centers = 2, nstart=25)
+
+label_vec <-  c(km$cluster, rep(0, 14))
+
+
+plot_tSNE_3classes <- function(tsne_res, dims, clusterable_data) {
+  
+  if (dims == 2){
+    
+  tsne_plot <- 
+    tsne_res %>%
+    as_tibble(.) %>% 
+    mutate(Label = factor(clusterable_data$y, labels = c("depressed", "Control 1", "Control 2")))%>% 
+    ggplot(aes(x=V1,
+               y=V2,
+               color = Label)) + 
+    geom_point(size = 2.5) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          text = element_text(size = 18)) +
+    labs(title = glue("t-SNE Clustering on {dataset} feature set"), 
+         subtitle = glue("{dims} dimensional representation of perplexity = {perplx}"))
+  
+  } else if (dims == 3){
+    
+    mycolors <- c('oldlace', 'royalblue1', 'orange2')
+    tsne_plot <-
+      tsne_res %>% 
+      as_tibble(.) %>%
+      mutate(Label = factor(clusterable_data$y, labels = c("depressed", "Control 1", "Control 2")))%>% 
+      mutate(Color = mycolors[as.numeric(Label)]) %>%
+      plot3d(x=.$V1, y=.$V2, z=.$V3, 
+      col = .$Color, 
+      type = 's', 
+      size = 5.5,
+      radius = 4.5,
+      xlab="V1", ylab="V2", zlab="V3")
+    
+  }
+  
+  return(tsne_plot)
+  
+}
+
+clusterable_DCM %>% 
+  mutate(y = as.factor(label_vec)) %>% 
+  plot_tSNE_3classes(DCM_tsne, dims, .)
+
+```
+
+
+
+```{r}
+
+ERP_tsne =  tsne(as.matrix(dplyr::select(ERP_values_top10_wide, -y, -SubjID)),
+                k = dims,
+                perplexity = perplx,
+                max_iter = iterations,
+                epoch = 500)
+
+```
+
+```{r}
+
+# dataset = "ERP"
+# ERP_cluster <- plot_tSNE(ERP_tsne, dims, ERP_clusterable_data) 
+
+dataset = "ERP"
+ERP_cluster <- plot_tSNE(ERP_tsne, dims, ERP_values_top10_wide)
+
+ERP_cluster
+
+```
+
+```{r}
+
+library(cluster)
+
+silhouette_score <- function(k){
+  km <- kmeans(ERP_tsne, centers = k, nstart=25)
+  ss <- silhouette(km$cluster, dist(ERP_tsne))
+  mean(ss[, 3])
+}
+
+silhouette_sd_score <- 
+  function(k){
+    km <- kmeans(ERP_tsne, centers = k, nstart=25)
+    ss <- silhouette(km$cluster, dist(ERP_tsne))
+    sd(ss[, 3], na.rm = FALSE)
+    }
+
+k <- 2:12
+avg_sil <- sapply(k, silhouette_score)
+sd_sil <- sapply(k, silhouette_sd_score)
+
+ERP_All <- tibble(Participants = "All",
+            Features = "ERP",
+            k = k,
+            `Avg Silhouette Score` = avg_sil,
+            `SD Silhouette Score` = sd_sil)
+
+plot(k, type='b', avg_sil, xlab='Number of clusters', ylab='Average Silhouette Scores', frame=FALSE)
+
+```
+
+```{r}
+library(cluster)
+
+silhouette_score <- function(k){
+  km <- kmeans(ERP_tsne[1:35,], centers = k, nstart=25)
+  ss <- silhouette(km$cluster, dist(ERP_tsne[1:35,]))
+  mean(ss[, 3])
+}
+silhouette_sd_score <- 
+  function(k){
+    km <- kmeans(ERP_tsne[1:35,], centers = k, nstart=25)
+    ss <- silhouette(km$cluster, dist(ERP_tsne[1:35,]))
+    sd(ss[, 3], na.rm = FALSE)
+    }
+
+k <- 2:12
+avg_sil <- sapply(k, silhouette_score)
+sd_sil <- sapply(k, silhouette_sd_score)
+
+ERP_Controls <- tibble(Participants = "Control",
+            Features = "ERP",
+            k = k,
+            `Avg Silhouette Score` = avg_sil,
+            `SD Silhouette Score` = sd_sil)
+
+plot(k, type='b', avg_sil, xlab='Number of clusters', ylab='Average Silhouette Scores', frame=FALSE)
+
+```
+
+```{r}
+library(cluster)
+
+silhouette_score <- function(k){
+  km <- kmeans(ERP_tsne[36:49,], centers = k, nstart=25)
+  ss <- silhouette(km$cluster, dist(ERP_tsne[36:49,]))
+  mean(ss[, 3])
+}
+
+silhouette_sd_score <- 
+  function(k){
+    km <- kmeans(ERP_tsne[36:49,], centers = k, nstart=25)
+    ss <- silhouette(km$cluster, dist(ERP_tsne[36:49,]))
+    sd(ss[, 3], na.rm = FALSE)
+    }
+
+k <- 2:12
+avg_sil <- sapply(k, silhouette_score)
+sd_sil <- sapply(k, silhouette_sd_score)
+
+ERP_Patients <- tibble(Participants = "Patient",
+            Features = "ERP",
+            k = k,
+            `Avg Silhouette Score` = avg_sil,
+            `SD Silhouette Score` = sd_sil)
+
+plot(k, type='b', avg_sil, xlab='Number of clusters', ylab='Average Silhouette Scores', frame=FALSE)
+
+```
+
+```{r}
+# Combine Avg Sil results
+
+# combined_Avg_Sil_Scores <- 
+#   bind_rows(DCM_All, DCM_Patients, DCM_Controls, ERP_All, ERP_Patients, ERP_Controls)
+
+combined_Avg_Sil_Scores <- 
+  bind_rows(DCM_All, DCM_Patients, ERP_All, ERP_Patients) %>% 
+  mutate(`Std Error` = `SD Silhouette Score`/sqrt(48))
+  
+
+
+SilScorePLot <- combined_Avg_Sil_Scores %>% 
+  ggplot(aes(x = k, 
+             y = `Avg Silhouette Score`, 
+             color = Participants, 
+             linetype = Features,
+             shape = Features)) + 
+  # facet_grid(.~Features) +
+  geom_pointrange(aes(ymin = (`Avg Silhouette Score` - `Std Error`), 
+                      ymax = (`Avg Silhouette Score` + `Std Error`)), position = position_dodge(width = .5)) +
+  geom_line() +
+  guides(linetype = "none") +
+  labs(title = "Mean Silhouette Scores by Features and Participants",
+       y = "Mean Silhouette Score") +
+  scale_x_continuous(breaks = seq(1:13), 
+                     labels = as.character(seq(1:13))) +
+  # scale_y_continuous(breaks = seq(0:0.5, .1),
+                     # expand(0,0)) +
+  theme_classic(base_size = 16)
+
+SilScorePLot
+
+```
+
+
+## Multi cluster 3d plot 
+
+```{r}
+km <- kmeans(ERP_tsne[36:49,], centers = 4, nstart=25)
+
+label_vec <- c(rep(0, 35), km$cluster)
+
+
+plot_tSNE_5classes <- function(tsne_res, dims, clusterable_data) {
+  
+  if (dims == 2){
+    
+  tsne_plot <- 
+    tsne_res %>%
+    as_tibble(.) %>% 
+    mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient - 1", "Depressed Patient - 2", "Depressed Patient - 3", "Depressed Patient - 4"))) %>% 
+    ggplot(aes(x=V1,
+               y=V2,
+               color = Label)) + 
+    geom_point(size = 2.5) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          text = element_text(size = 18)) +
+    labs(title = glue("t-SNE Clustering on {dataset} feature set"), 
+         subtitle = glue("{dims} dimensional representation of perplexity = {perplx}"))
+  
+  } else if (dims == 3){
+    
+    mycolors <- c('oldlace', 'royalblue1', 'green2', 'red1', 'orange2')
+    tsne_plot <-
+      tsne_res %>% 
+      as_tibble(.) %>%
+      mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient - 1", "Depressed Patient - 2", "Depressed Patient - 3", "Depressed Patient - 4"))) %>% 
+      mutate(Color = mycolors[as.numeric(Label)]) %>%
+      plot3d(x=.$V1, y=.$V2, z=.$V3, 
+      col = .$Color, 
+      type = 's', 
+      size = 4.5,
+      radius = 4.5,
+      xlab="V1", ylab="V2", zlab="V3")
+    
+  }
+  
+  return(tsne_plot)
+  
+}
+
+ERP_values_top10_wide %>% 
+  mutate(y = as.factor(label_vec)) %>% 
+  plot_tSNE_5classes(ERP_tsne, dims, .)
+```
+
+
+## Variability of values for top 10 features
+
+
+```{r}
+library(raincloudplots)
+library(gghalves)
+
+```
+
+```{r}
+
+
+DCM_rainpplot <- 
+  ggplot(data = Long_DCM10, aes(x=name, y=value, fill = y, color = y, alpha = .5)) +
+  geom_point(position = position_nudge(x = .1)) +
+  geom_half_violin(position = position_nudge(x = .35), side = "r") +
+  geom_half_boxplot(position = position_nudge(x = .2), side = "r",outlier.shape = NA, center = TRUE, errorbar.draw = FALSE, width = .2) +
+  theme_classic() +
+  guides(alpha = F) +
+  labs(y = "", x = "DCM Variable")
+
+
+DCM_rainpplot
+```
+
+
+```{r}
+DCM_rainPlot <- 
+  Long_DCM10 %>% 
+  rename(Parameter_Label = name) %>% 
+  left_join(., DCM_top10_Parmeter_Labels_Names,  by = "Parameter_Label") %>%
+  mutate(Class = factor(y, labels = c("Control", "Patient"))) %>% 
+  ggplot(aes(x=Parameter_Name, y=value, fill = Class, color = Class, alpha = .5)) + 
+  # coord_flip() +
+  geom_point(position = position_nudge(x = .1)) +
+  geom_half_violin(position = position_nudge(x = .35), side = "r") +
+  geom_half_boxplot(position = position_nudge(x = .2), side = "r", outlier.shape = NA, center = TRUE, errorbar.draw = FALSE, width = .2) +
+  theme_classic() +
+  guides(alpha = F) +
+  labs(y = "", x = "", title = "DCM") +
+  theme(axis.text.x = element_text(angle = 70, hjust=1, size = 15),
+        axis.text.y = element_text(size = 15))
+
+DCM_rainPlot
+
+```
+
+```{r ERP}
+
+normalize <- function(x, ...) {
+    return((x - min(x, ...)) /(max(x, ...) - min(x, ...)))
+}
+
+
+ERP_rainPlot <- 
+  ERP_values_top10_long %>% 
+  mutate(Class = factor(y, labels = c("Control", "Patient"))) %>% 
+  mutate(Feature_Type = ifelse(str_detect(feature, "PeakAmp"),
+                               "PeakAmp",
+                               "Latency")) %>% 
+  group_by(feature) %>%
+  mutate(value = normalize(value)) %>%
+  # ungroup() %>% 
+  # filter(Feature_Type == "Latency") %>% 
+  ggplot(aes(x=feature, y=value, fill = Class, color = Class, alpha = .4)) + 
+  # facet_grid(Feature_Type~., scales = "free") +
+  # coord_flip() +
+  geom_point(position = position_nudge(x = .1)) +
+  geom_half_violin(position = position_nudge(x = .35), 
+                   side = "r") +
+  geom_half_boxplot(position = position_nudge(x = .2),
+                    side = "r", 
+                    outlier.shape = NA,
+                    center = TRUE,
+                    errorbar.draw = FALSE,
+                    width = .2) +
+  theme_classic() +
+  guides(alpha = F) +
+  labs(y = "", x = "", title = "EEG/ERP") +
+  theme(axis.text.x = element_text(angle = 70, hjust=1, size = 15),
+        axis.text.y = element_text(size = 15))
+
+
+ERP_rainPlot
+
+```
+
+
+```{r}
+
+
+library(patchwork)
+
+distributions_patchwork <- DCM_rainPlot / ERP_rainPlot + plot_annotation(title = "Input Feature Distributions", tag_levels = 'A')
+
+distributions_patchwork
+
+```
+
+
+
+## UMAP results
+
+```{r umap}
+
+set.seed(321)
+
+dims = 2
+# ERP_umap <- recipe(df_wide, y ~ .) %>% # all features
+ERP_umap <- recipe(ERP_values_top10_wide[, -1], y ~ .) %>% # top10 only
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors()) %>%
+  step_umap(all_predictors(),
+            # outcome = vars(y),
+            neighbors = 5,
+            num_comp = dims,
+            # min_dist = 0.1,
+            epochs = 1000) |> 
+  prep() %>%
+  juice()
+  
+
+ # DCM_umap <- recipe(DCM_df, y ~ .) %>% # all features
+ DCM_umap <- recipe(clusterable_DCM, y ~ .) %>% # top10 only
+  step_zv(all_predictors()) %>% 
+  step_umap(all_predictors(),
+            neighbors = 5,
+            # outcome = vars(y),
+            num_comp = dims,
+            # min_dist = 0.1,
+            epochs = 1000) |>  
+  prep() %>%
+  juice()
+
+
+```
+
+#### Plot results
+
+
+```{r}
+plot_umap <- function(tsne_res, dims, clusterable_data) {
+  
+  if (dims == 2){
+    
+  tsne_plot <- 
+    tsne_res %>%
+    as_tibble(.) %>% 
+    mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient"))) %>% 
+    ggplot(aes(x=UMAP1,
+               y=UMAP2,
+               color = Label)) + 
+    geom_point(size = 2.5) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          text = element_text(size = 18)) +
+    labs(title = glue("UMAP Embeddings of {dataset} feature set"), 
+         subtitle = glue("{dims} dimensional representation"))
+  
+  } else if (dims == 3){
+    
+    mycolors <- c("#296dc0", "#ff5529")
+    
+    tsne_plot <-
+      tsne_res %>% 
+      as_tibble(.) %>%
+      mutate(Label = factor(clusterable_data$y, labels = c("Control", "Depressed Patient"))) %>% 
+      mutate(Color = mycolors[as.numeric(Label)]) %>%
+      plot3d(x=.$UMAP1, y=.$UMAP2, z=.$UMAP3, 
+      col = .$Color, 
+      type = 's', 
+      size = 0.7,
+      radius = 0.4,
+      xlab="UMAP1", ylab="UMAP2", zlab="UMAP3")
+    
+    rgl_add_axes(x=tsne_res$UMAP1, y=tsne_res$UMAP2, z=tsne_res$UMAP3, show.bbox = TRUE)
+    # movie3d(spin3d(axis = c(0, 0, 1)), duration = 3,
+    #     dir = getwd())
+  }
+  
+  return(tsne_plot)
+  
+}
+```
+
+
+```{r threeD plots}
+dataset = "ERP"
+ERP_cluster <- plot_umap(ERP_umap[, -1], dims, ERP_umap) 
+
+dataset = "DCM"
+DCM_cluster <- plot_umap(DCM_umap[, -1], dims, DCM_umap) 
+
+```
+
+
+```{r twoD plots}
+dataset = "ERP"
+plot_umap(ERP_umap[, -1], dims = dims, ERP_umap)
+
+
+dataset = "DCM"
+plot_umap(DCM_umap[, -1], dims = dims, DCM_umap)
+
+```
+
